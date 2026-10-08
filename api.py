@@ -11,7 +11,7 @@ def get_products(available_only: bool = False):
             available_products.append(product)
     if available_only:
         return {"products": available_products}
-    return {"products": products}
+    return {"products": products, "total": len(products)}
 @app.get("/products/{product_id}")
 def get_product(product_id: int):
     for product in products:
