@@ -1,24 +1,14 @@
-product_0 = {
-    "name": "Minecraft Key",
-    "price": 999,
-    "quantity": 15,
-    "is_for_sale" : True
-}
-product_1 = {
-    "name": "GTA V Key",
-    "price": 1499 ,
-    "quantity": 8,
-    "is_for_sale" : True
-}
-product_2 = {
-    "name": "Cyberpunk 2077 Key",
-    "price": 1999,
-    "quantity": 0,
-    "is_for_sale" : False
-}
-products = [product_0, product_1, product_2]
+products = [
+    {"name": "Minecraft Key", "price": 999, "quantity": 15, "is_for_sale" : True},
+    {"name": "GTA V Key", "price": 1499, "quantity": 0, "is_for_sale" : False},
+	{"name": "Cyberpunk 2077", "price": 1999, "quantity": 9, "is_for_sale" : True}
+]
+
+def show_product(name, price, quantity):
+    print(f"{name} - {price} RUB - in stock: {quantity}")
+    
 for product in products:
     if product["is_for_sale"] and product["quantity"] > 0:
-        print(f"{product['name']} - {product['price']} RUB - in stock: {product['quantity']}")
+        show_product(product["name"], product["price"], product["quantity"])
     else:
-        print(f"{product['name']} is not for sale.")    
+        print(f"{product['name']} Unavailable.")
