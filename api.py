@@ -63,3 +63,8 @@ def create_order(order: OrderRequest):
             }
 
     raise HTTPException(status_code=404, detail="Product not found")
+
+
+@app.get("/orders")
+def get_orders():
+    return {"orders": orders, "total": len(orders)}
