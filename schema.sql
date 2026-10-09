@@ -9,5 +9,6 @@ CREATE TABLE IF NOT EXISTS products (
 CREATE TABLE IF NOT EXISTS orders (
     id SERIAL PRIMARY KEY,
     product_id INTEGER NOT NULL REFERENCES products(id),
-    price INTEGER NOT NULL CHECK (price >= 0)
-);
+    price INTEGER NOT NULL CHECK (price >= 0),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'paid', 'cancelled', 'legacy'))
