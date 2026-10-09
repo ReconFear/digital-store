@@ -76,9 +76,7 @@ def create_order(order: OrderRequest):
 
 @app.get("/orders")
 def get_orders():
-    orders = get_orders_from_db()
-
-    return {
-        "orders": orders,
-        "total": len(orders)
-    }
+    raise HTTPException(
+        status_code=403,
+        detail="Order listing is not public"
+    )
