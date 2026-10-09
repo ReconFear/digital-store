@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from products import products
 from database import get_products_from_db, create_order_in_db, get_orders_from_db
 
@@ -19,7 +19,7 @@ app.add_middleware(
 
 orders = []
 class OrderRequest(BaseModel):
-    product_id: int
+    product_id: int = Field(gt=0)
 @app.get("/products")
 def get_products(available_only: bool = False):
     products = get_products_from_db()
