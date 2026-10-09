@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from products import products
+from database import get_products_from_db, create_order_in_db, get_orders_from_db
 
 app = FastAPI()
 
@@ -9,6 +10,7 @@ class OrderRequest(BaseModel):
     product_id: int
 @app.get("/products")
 def get_products(available_only: bool = False):
+    products = get_products_from_db()
     available_products = []
 
     for product in products:
@@ -29,6 +31,7 @@ def get_products(available_only: bool = False):
     raise HTTPException(status_code=404, detail="Product not found")
 @app.get("/products/{product_id}")
 def get_product(product_id: int):
+    products = get_products_from_db()
     for product in products:
         if product["id"] == product_id:
             return product
@@ -39,32 +42,31 @@ def get_product(product_id: int):
     )
 @app.post("/orders")
 def create_order(order: OrderRequest):
-    for product in products:
-        if product["id"] == order.product_id:
+    result = create_order_in_db(order.product_id)
 
-            if not product["is_for_sale"] or product["quantity"] <= 0:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Product unavailable"
-                )
+    if result.get("error") == "not_found":
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
 
-            new_order = {
-                "id": len(orders) + 1,
-                "product_id": product["id"],
-                "price": product["price"]
-            }
+    if result.get("error") == "unavailable":
+        raise HTTPException(
+            status_code=409,
+            detail="Product unavailable"
+        )
 
-            orders.append(new_order)
-            product["quantity"] -= 1
-
-            return {
-                "message": "Order created",
-                "order": new_order
-            }
-
-    raise HTTPException(status_code=404, detail="Product not found")
+    return {
+        "message": "Order created",
+        "order": result
+    }
 
 
 @app.get("/orders")
 def get_orders():
-    return {"orders": orders, "total": len(orders)}
+    orders = get_orders_from_db()
+
+    return {
+        "orders": orders,
+        "total": len(orders)
+    }
