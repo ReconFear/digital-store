@@ -45,12 +45,9 @@ def create_order_in_db(product_id):
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                UPDATE products
-                SET quantity = quantity - 1
+                SELECT id, price, quantity, is_for_sale
+                FROM products
                 WHERE id = %s
-                  AND quantity > 0
-                  AND is_for_sale = TRUE
-                RETURNING id, price
                 """,
                 (product_id,)
             )
@@ -58,20 +55,15 @@ def create_order_in_db(product_id):
             product = cursor.fetchone()
 
             if product is None:
-                cursor.execute(
-                    "SELECT id FROM products WHERE id = %s",
-                    (product_id,)
-                )
+                return {"error": "not_found"}
 
-                if cursor.fetchone() is None:
-                    return {"error": "not_found"}
-
+            if product[2] <= 0 or not product[3]:
                 return {"error": "unavailable"}
 
             cursor.execute(
                 """
-                INSERT INTO orders (product_id, price)
-                VALUES (%s, %s)
+                INSERT INTO orders (product_id, price, status)
+                VALUES (%s, %s, 'pending')
                 RETURNING id
                 """,
                 (product[0], product[1])
@@ -82,7 +74,8 @@ def create_order_in_db(product_id):
             return {
                 "id": order_id,
                 "product_id": product[0],
-                "price": product[1]
+                "price": product[1],
+                "status": "pending"
             }
 
 
