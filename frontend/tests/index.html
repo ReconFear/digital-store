@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Тесты API-клиента</title>
+  <link rel="stylesheet" href="tests.css">
+</head>
+<body>
+  <h1>Тесты JS-клиента Digital Store</h1>
+  <p>Тесты не обращаются к серверу: запросы подменяются. Страница должна быть открыта через HTTP-сервер, а не как file://.</p>
+  <p id="summary" role="status">Выполняются…</p>
+  <ol id="results"></ol>
+  <script type="module" src="run-browser.js"></script>
+</body>
+</html>

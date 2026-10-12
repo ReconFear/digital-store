@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Политика безопасности: скрипты и стили только из своих файлов, никаких inline-скриптов.
+       connect-src разрешает запросы к backend по http/https (адрес задаётся в config.js). -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src http: https:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Digital Store — демо-витрина</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="#/">Digital Store</a>
+      <span class="badge">демо интеграции</span>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <h1 id="page-title">Каталог</h1>
+    <div class="toolbar" id="catalog-toolbar">
+      <label class="toggle">
+        <input type="checkbox" id="available-only">
+        Только в наличии
+      </label>
+    </div>
+
+    <!-- Сюда app.js выводит загрузку, пустой каталог, ошибки и кнопку «Повторить». -->
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+
+    <!-- Сюда app.js выводит карточки товаров или страницу одного товара. -->
+    <section id="content" aria-labelledby="page-title"></section>
+  </main>
+
+  <footer class="wrap site-footer">
+    Демонстрация подключения frontend к API. Оплата и оформление покупки в этой версии не реализованы.
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -6,19 +6,13 @@ from database import (
     get_public_product_from_db,
     get_public_products_from_db,
 )
+from cors_settings import cors_middleware_options
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5500",
-        "http://127.0.0.1:5500",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173"
-    ],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+
+# Какие frontend-адреса браузер пустит к API. Настраивается переменной
+# CORS_ALLOWED_ORIGINS (см. cors_settings.py). CORS — не защита API.
+app.add_middleware(CORSMiddleware, **cors_middleware_options())
 
 
 class OrderRequest(BaseModel):

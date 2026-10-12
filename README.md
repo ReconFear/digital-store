@@ -12,6 +12,7 @@ Backend: Python, FastAPI, PostgreSQL (psycopg 3). Frontend разрабатыв�
 - Создание заказа в статусе `pending` с серверной проверкой существования и доступности товара. Остаток при создании заказа не уменьшается.
 - Внутренняя функция применения проверенного платежа (`payment_service.apply_verified_payment`). Публичного способа подтвердить оплату нет и быть не должно.
 - Закрытый публичный список заказов (`403`).
+- Frontend Bridge: настраиваемый CORS, независимый JS-клиент API (`frontend/lib/digital-store-api.js`) и демо-витрина на чистом HTML/CSS/JS.
 - Система SQL-миграций с журналом применённых изменений (`migrate.py`).
 - Тесты API и интеграционные тесты на отдельной тестовой базе с предохранителем от основной базы.
 
@@ -20,6 +21,7 @@ Backend: Python, FastAPI, PostgreSQL (psycopg 3). Frontend разрабатыв�
 ```text
 digital-store/
 ├── api.py                  # FastAPI-приложение и маршруты (api:app)
+├── cors_settings.py        # разрешённые frontend-адреса (CORS_ALLOWED_ORIGINS)
 ├── database.py             # подключение к PostgreSQL и запросы каталога/заказов
 ├── payment_service.py      # внутренняя логика применения подтверждённой оплаты
 ├── migrate.py              # система миграций (status / apply)
@@ -32,8 +34,14 @@ digital-store/
 ├── tests/
 │   ├── conftest.py         # предохранитель тестовой базы и общие фикстуры
 │   └── test_*.py
+├── frontend/
+│   ├── lib/digital-store-api.js   # JS-клиент API для любой HTML/CSS-темы
+│   ├── examples/vanilla-storefront/  # демо-витрина и тестовая страница заказа
+│   ├── tests/              # тесты JS-клиента (в браузере или Node)
+│   └── serve.py            # локальный сервер только для папки frontend/
 ├── requirements.txt
 ├── FRONTEND_API.md         # контракт API для фронтенда
+├── FRONTEND_INTEGRATION.md # как подключить frontend (инструкция для Артёма)
 └── README.md
 ```
 
@@ -62,6 +70,10 @@ DB_PORT=5432
 DB_NAME=digital_store
 DB_USER=postgres
 DB_PASSWORD=YOUR_PASSWORD
+
+# Необязательно: какие frontend-адреса браузер пустит к API (через запятую).
+# Не задано — локальные порты 5500 и 5173 (localhost и 127.0.0.1).
+# CORS_ALLOWED_ORIGINS=http://localhost:5500,http://127.0.0.1:5500
 ```
 
 `.env` не должен попадать в Git.
@@ -136,6 +148,23 @@ CREATE DATABASE digital_store_test;
 - API: http://127.0.0.1:8000
 - Swagger: http://127.0.0.1:8000/docs
 
+### 7. Запуск frontend (демо и тесты JS-клиента)
+
+Во втором окне PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe frontend\serve.py
+```
+
+- Демо-витрина: http://127.0.0.1:5500/examples/vanilla-storefront/
+- Тесты JS-клиента: http://127.0.0.1:5500/tests/
+
+Подробно — в **`FRONTEND_INTEGRATION.md`**. Не раздавайте корень проекта через `python -m http.server`: так станет доступен `.env`.
+
+### CORS
+
+Разрешённые frontend-адреса задаются `CORS_ALLOWED_ORIGINS` (см. `cors_settings.py`). `*` и `null` запрещены, cookies не разрешены, методы — `GET`/`POST`, дополнительный заголовок — только `Content-Type`. CORS не защищает API от прямых запросов: это делают аутентификация и проверка прав (ещё не реализованы).
+
 `--reload` — только для локальной разработки.
 
 ## Основные маршруты API
@@ -189,6 +218,11 @@ Remove-Item Env:DB_USER, Env:DB_PASSWORD
 
 Пишите интеграционные тесты так, чтобы они создавали свои данные и откатывали их (фикстура `shared_test_connection`) или работали во временной схеме (см. `tests/test_migrations.py`).
 
+**Тесты JS-клиента** (без сервера, запросы подменяются):
+
+- в браузере: запустить `frontend\serve.py` и открыть http://127.0.0.1:5500/tests/;
+- или, если установлен Node.js 22.7+: `node frontend\tests\run-node.mjs`.
+
 Зелёные тесты не доказывают готовность к коммерческому запуску.
 
 ## Ограничения текущей версии
@@ -196,6 +230,6 @@ Remove-Item Env:DB_USER, Env:DB_PASSWORD
 - Платёжный провайдер не подключён; заказ нельзя оплатить.
 - Резервирования товара нет: несколько неоплаченных заказов могут претендовать на последнюю единицу.
 - Выдача цифровых товаров, корзина, заказы из нескольких позиций, аутентификация, кабинет покупателя и админ-API ещё не реализованы.
-- CORS настроен только для локальной разработки.
+- CORS по умолчанию разрешает только локальные адреса разработки; для сервера задайте `CORS_ALLOWED_ORIGINS`.
 
 Перед публичным запуском необходимо реализовать и проверить платежи, выдачу, безопасность, развёртывание, резервное копирование и восстановление.

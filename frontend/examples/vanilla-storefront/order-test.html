@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src http: https:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>ТЕСТ: создание заказа — Digital Store</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="wrap">
+    <h1>Тестовая страница: POST /orders</h1>
+
+    <div class="message message--error">
+      <p>Только для разработчиков и только с тестовой базой.</p>
+      <p>Кнопка создаёт <strong>настоящую запись заказа</strong> в той базе, к которой подключён backend
+        (по умолчанию из <code>.env</code> — основная <code>digital_store</code>!).
+        Заказ получает статус <code>pending</code>. Оплаты нет, товар не резервируется и не выдаётся —
+        это проверка связи frontend ↔ backend, а не покупка.</p>
+      <p>Перед проверкой запустите backend на тестовой базе:
+        <code>$env:DB_NAME = "digital_store_test"</code>.</p>
+    </div>
+
+    <form id="order-form" class="product" novalidate>
+      <label for="product-id">ID товара</label>
+      <input id="product-id" name="product-id" type="number" min="1" step="1" required inputmode="numeric">
+      <label class="toggle">
+        <input type="checkbox" id="confirm">
+        Понимаю: будет создан реальный заказ в базе backend
+      </label>
+      <button class="button" type="submit" id="submit" disabled>Создать тестовый заказ</button>
+    </form>
+
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+    <p><a href="./">← Демо-витрина</a></p>
+  </main>
+  <script type="module" src="order-test.js"></script>
+</body>
+</html>
