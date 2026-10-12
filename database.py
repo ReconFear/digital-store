@@ -8,6 +8,13 @@ load_dotenv()
 
 PRODUCT_COLUMNS = "id, name, price, quantity, is_for_sale"
 
+# Старый API (v1) отдаёт цену целыми рублями (price) и остаток (quantity).
+# Поэтому в v1 видны только товары, которые этот формат может описать честно:
+# с учётом остатка и с ценой в целых рублях (price не NULL => RUB и целые рубли,
+# см. products_legacy_price_check). Это все товары, созданные до PR 2.
+# Товары без учёта остатка или с копейками/другой валютой видны только в API v2.
+V1_COMPATIBLE = "inventory_mode = 'tracked' AND price IS NOT NULL"
+
 
 def get_connection():
     return psycopg.connect(
@@ -49,7 +56,7 @@ def get_public_products_from_db(available_only=False):
 
     available_only=True дополнительно убирает товары с нулевым остатком.
     """
-    query = f"SELECT {PRODUCT_COLUMNS} FROM products WHERE is_for_sale = TRUE"
+    query = f"SELECT {PRODUCT_COLUMNS} FROM products WHERE is_for_sale = TRUE AND {V1_COMPATIBLE}"
 
     if available_only:
         query += " AND quantity > 0"
@@ -73,6 +80,7 @@ def get_public_product_from_db(product_id):
                 FROM products
                 WHERE id = %s
                   AND is_for_sale = TRUE
+                  AND {V1_COMPATIBLE}
                 """,
                 (product_id,)
             )
@@ -83,11 +91,17 @@ def get_public_product_from_db(product_id):
 
 
 def create_order_in_db(product_id):
+    """Заказ старого формата (v1, один товар). Контракт не менялся.
+
+    После миграции 0002 строка orders старого формата автоматически получает
+    валюту, итог и одну позицию order_items (триггеры orders_fill_legacy_columns
+    и orders_create_legacy_item), поэтому её обрабатывает общее ядро.
+    """
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                """
-                SELECT id, price, quantity, is_for_sale
+                f"""
+                SELECT id, price, quantity, is_for_sale, ({V1_COMPATIBLE})
                 FROM products
                 WHERE id = %s
                 """,
@@ -96,7 +110,8 @@ def create_order_in_db(product_id):
 
             product = cursor.fetchone()
 
-            if product is None:
+            # Товар, который v1 не может описать, для v1 не существует (как и в каталоге v1).
+            if product is None or not product[4]:
                 return {"error": "not_found"}
 
             if product[2] <= 0 or not product[3]:

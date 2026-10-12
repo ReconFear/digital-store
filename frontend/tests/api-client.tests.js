@@ -5,10 +5,28 @@ import {
   createApiClient,
   DigitalStoreApiError,
   ENDPOINTS,
+  formatMoney,
   isInStock,
 } from "../lib/digital-store-api.js";
 
 const PRODUCT = { id: 1, name: "Minecraft Key", price: 999, quantity: 14, is_for_sale: true };
+
+const RUB = (amount_minor) => ({ amount_minor, currency: "RUB", exponent: 2 });
+const PRODUCT_V2 = {
+  id: 1, name: "Minecraft Key", product_type: "other", inventory_mode: "tracked",
+  price: RUB(99900), stock_quantity: 14, available: true,
+};
+const SERVICE_V2 = {
+  id: 7, name: "Консультация", product_type: "service", inventory_mode: "unlimited",
+  price: RUB(300050), stock_quantity: null, available: true,
+};
+const ORDER_V2 = {
+  id: 42, status: "pending", created_at: "2026-10-13T00:00:00+00:00", total: RUB(499850),
+  items: [
+    { product_id: 1, name: "Minecraft Key", product_type: "other", quantity: 2, unit_price: RUB(99900), line_total: RUB(199800) },
+    { product_id: 7, name: "Консультация", product_type: "service", quantity: 1, unit_price: RUB(300050), line_total: RUB(300050) },
+  ],
+};
 
 function assert(condition, message) {
   if (!condition) throw new Error(message || "assertion failed");
@@ -213,6 +231,76 @@ export const tests = [
     const fetch = fakeFetch(() => jsonResponse(200, PRODUCT));
     await createApiClient({ baseUrl: "https://shop.example.com/api/", fetch }).getProduct(1);
     assertEqual(fetch.calls[0].url, "https://shop.example.com/api/products/1");
+  }],
+
+  ["v2: getProductsV2 принимает товары без учёта остатка (stock_quantity: null)", async () => {
+    const fetch = fakeFetch(() => jsonResponse(200, { products: [PRODUCT_V2, SERVICE_V2], total: 2 }));
+    const result = await client(fetch).getProductsV2({ availableOnly: true });
+    assertEqual(result.products, [PRODUCT_V2, SERVICE_V2]);
+    assertEqual(fetch.calls[0].url, "http://127.0.0.1:8000/api/v2/products?available_only=true");
+  }],
+
+  ["v2: getProductsV2 отклоняет цену не в целых минимальных единицах", async () => {
+    for (const price of [{ amount_minor: 999.5, currency: "RUB", exponent: 2 }, { amount_minor: "99900", currency: "RUB", exponent: 2 }, 999]) {
+      const fetch = fakeFetch(() => jsonResponse(200, { products: [{ ...PRODUCT_V2, price }], total: 1 }));
+      await assertApiError(client(fetch).getProductsV2(), "invalid_response");
+    }
+  }],
+
+  ["v2: getProductV2 и not_found со структурированным detail", async () => {
+    const ok = fakeFetch(() => jsonResponse(200, SERVICE_V2));
+    assertEqual(await client(ok).getProductV2("7"), SERVICE_V2);
+    assertEqual(ok.calls[0].url, "http://127.0.0.1:8000/api/v2/products/7");
+
+    const detail = { code: "product_not_found", message: "Товар не найден или не продаётся.", product_ids: [5] };
+    const missing = fakeFetch(() => jsonResponse(404, { detail }));
+    const error = await assertApiError(client(missing).getProductV2(5), "not_found");
+    assertEqual(error.detail, detail);
+  }],
+
+  ["v2: createOrderV2 отправляет только product_id и quantity", async () => {
+    const fetch = fakeFetch(() => jsonResponse(201, { order: ORDER_V2 }));
+    const items = [{ product_id: 1, quantity: 2, price: 1, name: "подделка" }, { product_id: 7, quantity: 1 }];
+    const result = await client(fetch, { allowOrderCreation: true }).createOrderV2(items);
+    assertEqual(result, { order: ORDER_V2 });
+    assertEqual(fetch.calls[0].url, "http://127.0.0.1:8000/api/v2/orders");
+    assertEqual(fetch.calls[0].init.method, "POST");
+    assertEqual(fetch.calls[0].init.body, JSON.stringify({ items: [{ product_id: 1, quantity: 2 }, { product_id: 7, quantity: 1 }] }));
+  }],
+
+  ["v2: createOrderV2 выключен по умолчанию и проверяет позиции до запроса", async () => {
+    const fetch = fakeFetch(() => jsonResponse(201, { order: ORDER_V2 }));
+    await assertApiError(client(fetch).createOrderV2([{ product_id: 1, quantity: 1 }]), "orders_disabled");
+    const api = client(fetch, { allowOrderCreation: true });
+    for (const bad of [[], null, [{ product_id: 1 }], [{ product_id: 1, quantity: 0 }], [{ product_id: "1", quantity: 1 }], [{ product_id: 1, quantity: 1.5 }]]) {
+      await assertApiError(api.createOrderV2(bad), "invalid_argument");
+    }
+    assertEqual(fetch.calls.length, 0);
+  }],
+
+  ["v2: коды бизнес-ошибок из detail.code", async () => {
+    for (const [status, code] of [[409, "insufficient_stock"], [409, "mixed_currency"], [409, "unsupported_currency"]]) {
+      const fetch = fakeFetch(() => jsonResponse(status, { detail: { code, message: "x", product_ids: [1] } }));
+      const error = await assertApiError(client(fetch, { allowOrderCreation: true }).createOrderV2([{ product_id: 1, quantity: 1 }]), code);
+      assertEqual(error.detail.product_ids, [1]);
+    }
+  }],
+
+  ["v2: неожиданный формат заказа -> invalid_response", async () => {
+    const fetch = fakeFetch(() => jsonResponse(201, { order: { ...ORDER_V2, total: 4998.5 } }));
+    await assertApiError(client(fetch, { allowOrderCreation: true }).createOrderV2([{ product_id: 1, quantity: 1 }]), "invalid_response");
+  }],
+
+  ["formatMoney: копейки без float", async () => {
+    const plain = (text) => text.replace(/\s/g, " ");
+    assertEqual(plain(formatMoney(RUB(99950))), "999,50 ₽");
+    assertEqual(plain(formatMoney(RUB(99900))), "999 ₽");
+    assertEqual(plain(formatMoney(RUB(5))), "0,05 ₽");
+    assertEqual(plain(formatMoney(RUB(0))), "0 ₽");
+    assertEqual(plain(formatMoney(RUB(123456789012))), "1 234 567 890,12 ₽");
+    let thrown = false;
+    try { formatMoney({ amount_minor: 1.5, currency: "RUB", exponent: 2 }); } catch { thrown = true; }
+    assert(thrown, "дробные копейки должны отклоняться");
   }],
 
   ["isInStock и список эндпоинтов", async () => {

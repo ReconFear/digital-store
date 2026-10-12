@@ -34,6 +34,10 @@ VALUES ('Old product', 999, 14, TRUE), ('Hidden product', 1499, 0, FALSE);
 INSERT INTO orders (product_id, price) VALUES (1, 999);
 """
 
+# Колонки товаров, существовавшие до PR 2. Проверки «данные товаров не изменились»
+# сравнивают именно их: миграция 0002 добавляет новые колонки, но не трогает старые.
+LEGACY_PRODUCT_COLUMNS = "SELECT id, name, price, quantity, is_for_sale FROM products ORDER BY id"
+
 # Тот же SQL, что в историческом migration_001_order_status.sql, без BEGIN/COMMIT.
 MANUAL_001_SQL = """
 ALTER TABLE orders
@@ -132,7 +136,30 @@ def _structure(conn, schema):
         """,
         (schema,),
     )
-    text = repr((columns, constraints, indexes))
+    triggers = _query(
+        conn,
+        """
+        SELECT rel.relname, tg.tgname, pg_get_triggerdef(tg.oid)
+        FROM pg_trigger tg
+        JOIN pg_class rel ON rel.oid = tg.tgrelid
+        JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+        WHERE ns.nspname = %s AND NOT tg.tgisinternal
+        ORDER BY 1, 2
+        """,
+        (schema,),
+    )
+    functions = _query(
+        conn,
+        """
+        SELECT p.proname, pg_get_functiondef(p.oid)
+        FROM pg_proc p
+        JOIN pg_namespace ns ON ns.oid = p.pronamespace
+        WHERE ns.nspname = %s
+        ORDER BY 1
+        """,
+        (schema,),
+    )
+    text = repr((columns, constraints, indexes, triggers, functions))
     return text.replace(schema + ".", "").replace(schema, "<schema>")
 
 
@@ -224,18 +251,22 @@ def test_schema_sql_matches_migrations(make_schema):
 def test_old_database_without_status_keeps_data(make_schema):
     conn, schema = make_schema()
     _run(conn, OLD_STRUCTURE_SQL)
-    products_before = _query(conn, "SELECT * FROM products ORDER BY id")
+    products_before = _query(conn, LEGACY_PRODUCT_COLUMNS)
 
     migrate.apply_migrations(conn, log=_quiet)
 
     assert _query(conn, "SELECT id, product_id, price, status FROM orders") == [(1, 1, 999, "legacy")]
-    assert _query(conn, "SELECT * FROM products ORDER BY id") == products_before
+    assert _query(conn, LEGACY_PRODUCT_COLUMNS) == products_before
 
     _run(conn, "INSERT INTO orders (product_id, price) VALUES (1, 999)")
     assert _query(conn, "SELECT status FROM orders WHERE id = 2") == [("pending",)]
 
 
-def test_database_with_manually_applied_001_is_adopted_without_changes(make_schema):
+def test_database_with_manually_applied_001_is_adopted_without_changes(make_schema, tmp_path):
+    # Проверяем именно принятие 0000–0001: на такой базе они не должны ничего менять.
+    # Последующие миграции (0002+) меняют схему намеренно и проверяются отдельно.
+    for name in ("0000_baseline.sql", "0001_order_status.sql"):
+        shutil.copy(PROJECT_DIR / "migrations" / name, tmp_path)
     conn, schema = make_schema()
     _run(conn, OLD_STRUCTURE_SQL)
     _run(conn, MANUAL_001_SQL)
@@ -243,9 +274,9 @@ def test_database_with_manually_applied_001_is_adopted_without_changes(make_sche
     orders_before = _query(conn, "SELECT * FROM orders ORDER BY id")
     structure_before = _structure(conn, schema)
 
-    migrate.apply_migrations(conn, log=_quiet)
+    migrate.apply_migrations(conn, tmp_path, log=_quiet)
 
-    assert _applied_versions(conn) == [m.version for m in migrate.discover()]
+    assert _applied_versions(conn) == ["0000", "0001"]
     assert _query(conn, "SELECT * FROM orders ORDER BY id") == orders_before
     assert _structure(conn, schema) == structure_before
 
@@ -475,4 +506,4 @@ def test_behaviour_after_refusal(make_schema):
 
     assert _applied_versions(conn) == [m.version for m in migrate.discover()]
     assert _query(conn, "SELECT id, product_id, price, status FROM orders") == [(1, 1, 999, "legacy")]
-    assert _query(conn, "SELECT * FROM products ORDER BY id") == before[1]
+    assert _query(conn, LEGACY_PRODUCT_COLUMNS) == before[1]

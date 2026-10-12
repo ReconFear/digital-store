@@ -1,6 +1,18 @@
 # Digital Store — API для фронтенда
 
-Актуально для PR 1.5 «Frontend Bridge». Как подключить готовый JS-клиент — в [`FRONTEND_INTEGRATION.md`](FRONTEND_INTEGRATION.md).
+Актуально для PR 2 «Universal Commerce Core». Как подключить готовый JS-клиент — в [`FRONTEND_INTEGRATION.md`](FRONTEND_INTEGRATION.md).
+
+В API две версии:
+
+| | v1 — старый контракт | v2 — универсальное ядро |
+|---|---|---|
+| Адреса | `/products`, `/products/{id}`, `/orders` | `/api/v2/products`, `/api/v2/products/{id}`, `/api/v2/orders` |
+| Цена | `price`: целые рубли | `price`: `{ amount_minor, currency, exponent }`, копейки |
+| Остаток | `quantity` | `stock_quantity` (`null`, если не учитывается) + `available` |
+| Заказ | один товар | несколько позиций |
+| Статус | **не менялся**, действующая витрина работает как раньше | новый, для корзины и оформления |
+
+Разделы 1–5 ниже — v1 (без изменений). API v2 — в разделе «API v2».
 
 ## Адрес backend
 
@@ -152,6 +164,135 @@
 
 Итого: `detail` — строка для ошибок `403/404/405/409` и массив для `422`.
 
+## API v2
+
+### Деньги в v2
+
+```json
+{ "amount_minor": 99950, "currency": "RUB", "exponent": 2 }
+```
+
+Сумма = `amount_minor / 10^exponent` = 999,50 ₽. `amount_minor` — всегда целое. Не делите его во float для расчётов. Для показа есть `formatMoney()` в JS-клиенте.
+
+### Каталог v2
+
+**GET** `/api/v2/products` (и `?available_only=true`)
+
+Товары в продаже, включая те, у которых остаток не учитывается (услуги, файлы). Снятые с продажи не возвращаются.
+
+```json
+{
+  "products": [
+    {
+      "id": 1,
+      "name": "Minecraft Key",
+      "product_type": "other",
+      "inventory_mode": "tracked",
+      "price": { "amount_minor": 99900, "currency": "RUB", "exponent": 2 },
+      "stock_quantity": 14,
+      "available": true
+    },
+    {
+      "id": 7,
+      "name": "Консультация",
+      "product_type": "service",
+      "inventory_mode": "unlimited",
+      "price": { "amount_minor": 300050, "currency": "RUB", "exponent": 2 },
+      "stock_quantity": null,
+      "available": true
+    }
+  ],
+  "total": 2
+}
+```
+
+- `product_type`: `digital_key`, `digital_file`, `physical`, `service`, `other` (у всех старых товаров — `other`).
+- `inventory_mode`: `tracked` (есть остаток) или `unlimited`.
+- `stock_quantity`: остаток или `null` для `unlimited`.
+- `available`: можно ли заказать сейчас (`unlimited` — всегда `true`; `tracked` — если остаток > 0).
+- `available_only=true` оставляет только `available: true`.
+
+**GET** `/api/v2/products/{id}` — один товар в том же формате. Нет или снят с продажи → `404`:
+
+```json
+{ "detail": { "code": "product_not_found", "message": "Товар не найден или не продаётся.", "product_ids": [5] } }
+```
+
+### Создать заказ v2
+
+**POST** `/api/v2/orders`
+
+```json
+{
+  "items": [
+    { "product_id": 1, "quantity": 2 },
+    { "product_id": 7, "quantity": 1 }
+  ]
+}
+```
+
+- От 1 до 50 позиций. `product_id` и `quantity` — целые числа (строки `"2"` не принимаются), `quantity` от 1 до 1000.
+- Цену, итог, валюту и статус присылать **нельзя**: любые лишние поля → `422`. Всё считает сервер.
+- Повторяющиеся `product_id` объединяются, количества складываются.
+
+Успех — `201 Created`:
+
+```json
+{
+  "order": {
+    "id": 42,
+    "status": "pending",
+    "created_at": "2026-10-13T12:00:00.000000+03:00",
+    "total": { "amount_minor": 499850, "currency": "RUB", "exponent": 2 },
+    "items": [
+      {
+        "product_id": 1,
+        "name": "Minecraft Key",
+        "product_type": "other",
+        "quantity": 2,
+        "unit_price": { "amount_minor": 99900, "currency": "RUB", "exponent": 2 },
+        "line_total": { "amount_minor": 199800, "currency": "RUB", "exponent": 2 }
+      },
+      {
+        "product_id": 7,
+        "name": "Консультация",
+        "product_type": "service",
+        "quantity": 1,
+        "unit_price": { "amount_minor": 300050, "currency": "RUB", "exponent": 2 },
+        "line_total": { "amount_minor": 300050, "currency": "RUB", "exponent": 2 }
+      }
+    ]
+  }
+}
+```
+
+`status: "pending"` — заказ создан и ждёт оплаты. **Оплаты пока нет**, товар не резервируется и не выдаётся. Покажите покупателю номер заказа и итог от сервера, но не «Покупка завершена».
+
+Ошибки бизнес-правил — `detail` объект с `code`:
+
+| Код HTTP | `detail.code` | Когда |
+|---|---|---|
+| `404` | `product_not_found` | товара нет или он снят с продажи |
+| `409` | `insufficient_stock` | не хватает остатка (`product_ids` — каких товаров) |
+| `409` | `mixed_currency` | товары в разных валютах |
+| `409` | `unsupported_currency` | валюта товара не поддерживается магазином |
+| `422` | `quantity_too_large` | после объединения повторов больше 1000 единиц одного товара |
+| `422` | `too_many_items` | больше 50 разных товаров |
+| `422` | `amount_out_of_range` | итог вне допустимого диапазона |
+
+Ошибки **формата** запроса — стандартный `422` FastAPI, `detail` — массив (см. «Общие ответы FastAPI»). Отличить просто: в v2 `detail` — объект для бизнес-ошибок и массив для ошибок формата.
+
+Пример `409`:
+
+```json
+{ "detail": { "code": "insufficient_stock", "message": "Недостаточно товара в наличии.", "product_ids": [1] } }
+```
+
+### Чего в v2 нет
+
+- **Просмотра заказа** (`GET /api/v2/orders/{id}`): без входа покупателя его нельзя сделать безопасно — перебором номеров можно было бы смотреть чужие заказы. Сохраните ответ на создание заказа, если он нужен на странице «Спасибо».
+- Оплаты, отмены, возврата, выдачи товара.
+
 ## Что ещё не реализовано
 
-Оплата, выдача товара, корзина и заказ из нескольких позиций, аутентификация и кабинет покупателя, админ-API. Контракт этих частей будет согласован отдельно; до этого фронтенд может работать на mock-данных.
+Оплата, резервирование, выдача товара, отмена и возврат, просмотр заказа, аутентификация и кабинет покупателя, админ-API. Заказ из нескольких позиций есть в API v2; корзина хранится на стороне frontend. Контракт этих частей будет согласован отдельно; до этого фронтенд может работать на mock-данных.

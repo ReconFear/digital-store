@@ -95,3 +95,76 @@ def shared_test_connection(monkeypatch):
     finally:
         conn.rollback()
         conn.close()
+
+
+@pytest.fixture
+def make_product():
+    """Создаёт ЗАКОММИЧЕННЫЕ товары в тестовой базе и полностью удаляет их после теста
+    (вместе с заказами, позициями и задачами исполнения, где они встречаются).
+
+    Нужна для проверок, где участвуют несколько соединений (конкурентность, атомарность):
+    данные, не зафиксированные в базе, другие соединения не видят.
+    """
+    import uuid
+
+    import database
+
+    created = []
+
+    def factory(*, quantity=10, price_minor=10000, currency="RUB", is_for_sale=True,
+                product_type="other", inventory_mode="tracked", fulfillment_type="manual", name=None):
+        name = name or f"pytest-{uuid.uuid4().hex[:8]}"
+        with database.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO products (name, price_minor, currency, quantity, is_for_sale,
+                                          product_type, inventory_mode, fulfillment_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (name, price_minor, currency, quantity, is_for_sale,
+                     product_type, inventory_mode, fulfillment_type),
+                )
+                product_id = cursor.fetchone()[0]
+        created.append(product_id)
+        return product_id
+
+    yield factory
+
+    if not created:
+        return
+    with database.get_connection() as conn:
+        with conn.cursor() as cursor:
+            # История заказов защищена от удаления (миграция 0002); уборка тестовых данных —
+            # осознанное исключение только для этой транзакции.
+            cursor.execute("SET LOCAL digital_store.allow_history_delete = 'on'")
+            cursor.execute(
+                "SELECT DISTINCT order_id FROM order_items WHERE product_id = ANY(%s)", (created,)
+            )
+            order_ids = [row[0] for row in cursor.fetchall()]
+            if order_ids:
+                cursor.execute(
+                    """
+                    DELETE FROM fulfillments
+                    WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ANY(%s))
+                    """,
+                    (order_ids,),
+                )
+                cursor.execute("DELETE FROM order_items WHERE order_id = ANY(%s)", (order_ids,))
+                cursor.execute("DELETE FROM orders WHERE id = ANY(%s)", (order_ids,))
+            cursor.execute("DELETE FROM products WHERE id = ANY(%s)", (created,))
+
+
+@pytest.fixture
+def db_value():
+    """db_value(sql, params) — одно значение через отдельное соединение (видит только закоммиченное)."""
+    import database
+
+    def query(sql, params=None):
+        with database.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                return cursor.fetchone()[0]
+
+    return query

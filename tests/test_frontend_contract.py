@@ -43,13 +43,16 @@ def _frontend_scripts():
 def test_client_uses_only_existing_api_routes():
     endpoints = _client_endpoints()
 
-    assert endpoints == {"/products", "/products/{}", "/orders"}
+    assert endpoints == {
+        "/products", "/products/{}", "/orders",                          # v1 (без изменений)
+        "/api/v2/products", "/api/v2/products/{}", "/api/v2/orders",    # v2 (PR 2)
+    }
     assert endpoints <= _api_routes()
 
 
 def test_client_only_uses_paths_from_endpoints():
     source = _read(CLIENT)
-    literal_paths = set(re.findall(r'["`](/(?:products|orders)[^"`?]*)', source))
+    literal_paths = set(re.findall(r'["`](/(?:products|orders|api/)[^"`?]*)', source))
 
     assert {_normalize(p) for p in literal_paths} <= _client_endpoints()
 

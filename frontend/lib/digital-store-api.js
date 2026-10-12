@@ -11,6 +11,13 @@
  * Product: { id: number, name: string, price: number, quantity: number, is_for_sale: boolean }
  * price — целое число в рублях (см. FRONTEND_API.md).
  *
+ * API v2 (универсальное ядро, PR 2) — отдельные методы с суффиксом V2:
+ *   GET  /api/v2/products[?available_only=true] -> { products: ProductV2[], total }
+ *   GET  /api/v2/products/{id}                  -> ProductV2
+ *   POST /api/v2/orders { items: [{ product_id, quantity }] } -> 201 { order } (pending, БЕЗ оплаты)
+ * ProductV2: { id, name, product_type, inventory_mode, price: Money, stock_quantity: number|null, available }
+ * Money: { amount_minor: целое (копейки), currency: "RUB", exponent: 2 }
+ *
  * Пример:
  *   import { createApiClient } from "./digital-store-api.js";
  *   const api = createApiClient({ baseUrl: "http://127.0.0.1:8000" });
@@ -25,6 +32,9 @@ export const ENDPOINTS = Object.freeze({
   products: "/products",
   product: "/products/{id}",
   orders: "/orders",
+  productsV2: "/api/v2/products",
+  productV2: "/api/v2/products/{id}",
+  ordersV2: "/api/v2/orders",
 });
 
 /** Тексты для покупателя. Тема оформления может заменить их своими по полю `code`. */
@@ -39,6 +49,9 @@ export const USER_MESSAGES = Object.freeze({
   http: "Сервер магазина вернул ошибку.",
   invalid_response: "Сервер магазина вернул неожиданный ответ.",
   invalid_argument: "Неверные данные запроса.",
+  insufficient_stock: "Недостаточно товара в наличии. Уменьшите количество.",
+  mixed_currency: "Эти товары нельзя оформить одним заказом.",
+  unsupported_currency: "Этот товар сейчас нельзя заказать.",
   orders_disabled: "Оформление заказов отключено.",
   aborted: "Запрос отменён.",
 });
@@ -47,6 +60,7 @@ export const USER_MESSAGES = Object.freeze({
  * Единый тип ошибки клиента.
  *  - code: "network" | "timeout" | "aborted" | "not_found" | "unavailable" | "validation"
  *          | "forbidden" | "server" | "http" | "invalid_response" | "invalid_argument" | "orders_disabled"
+ *          | "insufficient_stock" | "mixed_currency" | "unsupported_currency" (только API v2)
  *  - status: HTTP-статус или null, если ответа не было
  *  - detail: поле `detail` из ответа backend (строка или массив ошибок валидации) или null
  *  - userMessage: готовый текст для интерфейса
@@ -70,6 +84,9 @@ export class DigitalStoreApiError extends Error {
 
 const STATUS_CODES = { 403: "forbidden", 404: "not_found", 409: "unavailable", 422: "validation" };
 
+// API v2 сообщает точную причину в detail.code; эти коды клиент передаёт как есть.
+const V2_DETAIL_CODES = ["insufficient_stock", "mixed_currency", "unsupported_currency"];
+
 function normalizeBaseUrl(baseUrl) {
   if (typeof baseUrl !== "string" || !baseUrl.trim()) {
     throw new TypeError("createApiClient: укажите baseUrl, например http://127.0.0.1:8000");
@@ -91,6 +108,57 @@ function normalizeBaseUrl(baseUrl) {
 
 function isPositiveId(value) {
   return Number.isSafeInteger(value) && value > 0;
+}
+
+function isMoney(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    Number.isSafeInteger(value.amount_minor) &&
+    value.amount_minor >= 0 &&
+    typeof value.currency === "string" &&
+    Number.isSafeInteger(value.exponent) &&
+    value.exponent >= 0
+  );
+}
+
+function isProductV2(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    isPositiveId(value.id) &&
+    typeof value.name === "string" &&
+    typeof value.product_type === "string" &&
+    (value.inventory_mode === "tracked" || value.inventory_mode === "unlimited") &&
+    isMoney(value.price) &&
+    (value.stock_quantity === null || Number.isSafeInteger(value.stock_quantity)) &&
+    typeof value.available === "boolean"
+  );
+}
+
+function isOrderV2(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    isPositiveId(value.id) &&
+    typeof value.status === "string" &&
+    isMoney(value.total) &&
+    Array.isArray(value.items) &&
+    value.items.length > 0 &&
+    value.items.every(
+      (item) =>
+        item &&
+        isPositiveId(item.product_id) &&
+        typeof item.name === "string" &&
+        Number.isSafeInteger(item.quantity) &&
+        isMoney(item.unit_price) &&
+        isMoney(item.line_total),
+    )
+  );
+}
+
+function toProductId(id) {
+  return typeof id === "string" && /^\d+$/.test(id) ? Number(id) : id;
 }
 
 function isProduct(value) {
@@ -176,8 +244,11 @@ export function createApiClient(options = {}) {
     }
 
     if (!response.ok) {
-      const code = STATUS_CODES[response.status] || (response.status >= 500 ? "server" : "http");
       const detail = data && typeof data === "object" ? data.detail ?? null : null;
+      const v2Code = detail && typeof detail === "object" && !Array.isArray(detail) ? detail.code : null;
+      const code = V2_DETAIL_CODES.includes(v2Code)
+        ? v2Code
+        : STATUS_CODES[response.status] || (response.status >= 500 ? "server" : "http");
       throw new DigitalStoreApiError(code, {
         status: response.status,
         detail,
@@ -261,7 +332,84 @@ export function createApiClient(options = {}) {
       }
       return { message: data.message, order };
     },
+
+    // ---------------- API v2 ----------------
+
+    /**
+     * Каталог v2: товары в продаже, включая товары без учёта остатка (услуги, файлы).
+     * @returns {Promise<{ products: object[], total: number }>}
+     */
+    async getProductsV2({ availableOnly = false, signal } = {}) {
+      const path = ENDPOINTS.productsV2 + (availableOnly ? "?available_only=true" : "");
+      const data = await request(path, { signal });
+      if (!Array.isArray(data.products) || typeof data.total !== "number" || !data.products.every(isProductV2)) {
+        throw invalidResponse(path, "неожиданный формат каталога v2");
+      }
+      return { products: data.products, total: data.total };
+    },
+
+    /** Один товар v2. Нет или снят с продажи — ошибка с code "not_found". */
+    async getProductV2(id, { signal } = {}) {
+      const numericId = toProductId(id);
+      if (!isPositiveId(numericId)) {
+        throw new DigitalStoreApiError("invalid_argument", { message: `getProductV2: неверный id ${String(id)}` });
+      }
+      const path = ENDPOINTS.productV2.replace("{id}", String(numericId));
+      const data = await request(path, { signal });
+      if (!isProductV2(data)) throw invalidResponse(path, "неожиданный формат товара v2");
+      return data;
+    },
+
+    /**
+     * Создаёт НАСТОЯЩИЙ заказ из нескольких позиций в статусе "pending" (ожидает оплаты).
+     * Передаются только product_id и quantity; цены и итог считает сервер.
+     * Оплаты, резерва и выдачи пока нет. Отключено без allowOrderCreation: true.
+     * @param {Array<{ product_id: number, quantity: number }>} items
+     * @returns {Promise<{ order: object }>}
+     */
+    async createOrderV2(items, { signal } = {}) {
+      if (!allowOrderCreation) {
+        throw new DigitalStoreApiError("orders_disabled", {
+          message: "createOrderV2 отключён: создайте клиент с allowOrderCreation: true",
+        });
+      }
+      const valid =
+        Array.isArray(items) &&
+        items.length > 0 &&
+        items.every(
+          (item) =>
+            item && isPositiveId(item.product_id) && Number.isSafeInteger(item.quantity) && item.quantity > 0,
+        );
+      if (!valid) {
+        throw new DigitalStoreApiError("invalid_argument", {
+          message: "createOrderV2: нужен непустой массив { product_id, quantity } с положительными целыми",
+        });
+      }
+      const body = { items: items.map(({ product_id, quantity }) => ({ product_id, quantity })) };
+      const data = await request(ENDPOINTS.ordersV2, { method: "POST", body, signal });
+      if (!isOrderV2(data.order)) throw invalidResponse(ENDPOINTS.ordersV2, "неожиданный формат заказа v2");
+      return { order: data.order };
+    },
   });
+}
+
+/**
+ * Форматирует сумму API v2 для показа: formatMoney({ amount_minor: 99950, currency: "RUB", exponent: 2 })
+ * -> "999,50 ₽". Только для отображения: итог заказа всегда считает сервер.
+ * Целые копейки переводятся в десятичную строку без деления float.
+ */
+export function formatMoney(money, locale = "ru-RU") {
+  if (!isMoney(money)) throw new TypeError("formatMoney: ожидается { amount_minor, currency, exponent }");
+  const { amount_minor: minor, currency, exponent } = money;
+  const digits = String(minor).padStart(exponent + 1, "0");
+  const decimal = exponent ? `${digits.slice(0, -exponent)}.${digits.slice(-exponent)}` : digits;
+  const fraction = minor % 10 ** exponent === 0 ? 0 : exponent;
+  return new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency,
+    minimumFractionDigits: fraction,
+    maximumFractionDigits: exponent,
+  }).format(decimal);
 }
 
 /** Удобная проверка наличия: товар в продаже и остаток больше нуля. */
