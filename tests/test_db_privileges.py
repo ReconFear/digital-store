@@ -55,9 +55,13 @@ class _Role:
         finally:
             conn.close()
 
-    def refused(self, sql, params=None, match="permission denied|must be owner|запрещ|нельзя"):
-        with pytest.raises(Exception, match=match):
-            self.run(sql, params)
+    def refused(self, sql, params=None, match=None):
+        if match is None:
+            with pytest.raises(database.psycopg.errors.InsufficientPrivilege):
+                self.run(sql, params)
+        else:
+            with pytest.raises(Exception, match=match):
+                self.run(sql, params)
 
 
 @pytest.fixture
@@ -223,7 +227,7 @@ def test_full_flow_under_separate_roles(shop_roles, as_role, yookassa, monkeypat
     web.accept_notification(notification("payment.succeeded", provider_id), "x")
 
     # Веб-роль сама учесть оплату не может.
-    with pytest.raises(Exception, match="permission denied"):
+    with pytest.raises(database.psycopg.errors.InsufficientPrivilege):
         web.sync_provider_payment(provider_id)
 
     assert [r[1] for r in worker.process_due_events()] == ["succeeded"]
