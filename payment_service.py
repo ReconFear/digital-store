@@ -20,7 +20,16 @@
    остаток невозможен), ставит "paid" и paid_at, создаёт задачи исполнения
    (fulfillments, статус "pending") — идемпотентно, ON CONFLICT DO NOTHING.
 Любая ошибка откатывает всё целиком.
+
+PR 3: сам алгоритм перенесён без изменений в SQL-функцию apply_paid_order()
+(migrations/0003_payments_security.sql), чтобы платёжный модуль вызывал его в ОДНОЙ
+транзакции с записью подтверждённой денежной операции (payment_record_provider_state).
+Здесь осталась тонкая обёртка с прежним интерфейсом и форматом ответа — для тестов,
+административных скриптов и совместимости. Роль приложения EXECUTE на apply_paid_order
+не получает (DB_ROLES.md): в рабочей конфигурации оплату проводит только платёжный модуль.
 """
+
+import json
 
 from database import get_connection
 
@@ -28,116 +37,7 @@ from database import get_connection
 def apply_verified_payment(order_id):
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT status
-                FROM orders
-                WHERE id = %s
-                FOR UPDATE
-                """,
-                (order_id,)
-            )
-
-            order = cursor.fetchone()
-
-            if order is None:
-                return {"error": "order_not_found"}
-
-            status = order[0]
-
-            if status == "paid":
-                return {"status": "already_paid"}
-
-            if status not in ("pending", "requires_action"):
-                return {"error": "invalid_order_status"}
-
-            cursor.execute(
-                """
-                SELECT product_id, sum(quantity)
-                FROM order_items
-                WHERE order_id = %s
-                GROUP BY product_id
-                ORDER BY product_id
-                """,
-                (order_id,)
-            )
-            needed = [(product_id, int(quantity)) for product_id, quantity in cursor.fetchall()]
-
-            if not needed:
-                # После миграции 0002 у каждого заказа есть позиции; это защита от порчи данных.
-                return {"error": "order_has_no_items"}
-
-            cursor.execute(
-                """
-                SELECT id, quantity, is_for_sale, inventory_mode
-                FROM products
-                WHERE id = ANY(%s)
-                ORDER BY id
-                FOR UPDATE
-                """,
-                ([product_id for product_id, _ in needed],)
-            )
-            stock = {row[0]: row for row in cursor.fetchall()}
-
-            problems = []
-            for product_id, quantity in needed:
-                _, available, is_for_sale, inventory_mode = stock[product_id]
-                if not is_for_sale:
-                    problems.append({"product_id": product_id, "reason": "not_for_sale"})
-                elif inventory_mode == "tracked" and available < quantity:
-                    problems.append({"product_id": product_id, "reason": "insufficient_stock"})
-
-            if problems:
-                cursor.execute(
-                    "UPDATE orders SET status = 'requires_action' WHERE id = %s",
-                    (order_id,)
-                )
-                return {
-                    "error": "out_of_stock",
-                    "order_id": order_id,
-                    "status": "requires_action",
-                    "problems": problems,
-                }
-
-            for product_id, quantity in needed:
-                if stock[product_id][3] != "tracked":
-                    continue
-                cursor.execute(
-                    """
-                    UPDATE products
-                    SET quantity = quantity - %s
-                    WHERE id = %s
-                      AND quantity >= %s
-                    RETURNING id
-                    """,
-                    (quantity, product_id, quantity)
-                )
-                if cursor.fetchone() is None:
-                    # Невозможно при удерживаемой блокировке; если случилось — откатить всё.
-                    raise RuntimeError(f"остаток товара {product_id} изменился во время оплаты")
-
-            cursor.execute(
-                """
-                UPDATE orders
-                SET status = 'paid', paid_at = now()
-                WHERE id = %s
-                """,
-                (order_id,)
-            )
-
-            cursor.execute(
-                """
-                INSERT INTO fulfillments (order_item_id, fulfillment_type)
-                SELECT id, fulfillment_type
-                FROM order_items
-                WHERE order_id = %s
-                ORDER BY id
-                ON CONFLICT (order_item_id) DO NOTHING
-                """,
-                (order_id,)
-            )
-
-            return {
-                "order_id": order_id,
-                "status": "paid"
-            }
+            cursor.execute("SELECT apply_paid_order(%s)", (order_id,))
+            result = cursor.fetchone()[0]
+            # psycopg 3 сам разбирает jsonb в dict; строка возможна у других драйверов.
+            return json.loads(result) if isinstance(result, str) else result

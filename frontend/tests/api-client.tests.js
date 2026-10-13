@@ -291,6 +291,66 @@ export const tests = [
     await assertApiError(client(fetch, { allowOrderCreation: true }).createOrderV2([{ product_id: 1, quantity: 1 }]), "invalid_response");
   }],
 
+  ["v2: createOrderV2 возвращает accessToken, если сервер его выдал (PR 3)", async () => {
+    const token = "A".repeat(40) + "_-9";
+    const fetch = fakeFetch(() => jsonResponse(201, { order: ORDER_V2, access_token: token }));
+    const result = await client(fetch, { allowOrderCreation: true }).createOrderV2([{ product_id: 1, quantity: 1 }]);
+    assertEqual(result, { order: ORDER_V2, accessToken: token });
+    const odd = fakeFetch(() => jsonResponse(201, { order: ORDER_V2, access_token: "<script>" }));
+    assertEqual(await client(odd, { allowOrderCreation: true }).createOrderV2([{ product_id: 1, quantity: 1 }]),
+      { order: ORDER_V2 });
+  }],
+
+  ["v2: checkoutV2 отправляет только секрет в теле и требует https-ссылку", async () => {
+    const token = "b".repeat(43);
+    const ok = { payment_status: "awaiting_payment", confirmation_url: "https://yoomoney.ru/checkout/payments/v2/contract?orderId=1" };
+    const fetch = fakeFetch(() => jsonResponse(200, ok));
+    const api = client(fetch, { allowOrderCreation: true });
+    assertEqual(await api.checkoutV2(42, token), ok);
+    assertEqual(fetch.calls[0].url, "http://127.0.0.1:8000/api/v2/orders/42/checkout");
+    assertEqual(fetch.calls[0].init.method, "POST");
+    assertEqual(fetch.calls[0].init.body, JSON.stringify({ access_token: token }));
+    assert(!fetch.calls[0].url.includes(token), "секрет не должен попадать в URL");
+
+    for (const bad of [{ ...ok, confirmation_url: "javascript:alert(1)" }, { ...ok, confirmation_url: "http://x" },
+                       { ...ok, payment_status: "succeeded" }]) {
+      await assertApiError(client(fakeFetch(() => jsonResponse(200, bad)), { allowOrderCreation: true }).checkoutV2(42, token),
+        "invalid_response");
+    }
+  }],
+
+  ["v2: checkoutV2 выключен по умолчанию и проверяет аргументы до запроса", async () => {
+    const fetch = fakeFetch(() => jsonResponse(200, {}));
+    await assertApiError(client(fetch).checkoutV2(1, "b".repeat(43)), "orders_disabled");
+    const api = client(fetch, { allowOrderCreation: true });
+    for (const [id, token] of [[0, "b".repeat(43)], ["1", "b".repeat(43)], [1, "short"], [1, null], [1, "b".repeat(42) + "/"]]) {
+      await assertApiError(api.checkoutV2(id, token), "invalid_argument");
+      await assertApiError(api.getOrderStatusV2(id, token), "invalid_argument");
+    }
+    assertEqual(fetch.calls.length, 0);
+  }],
+
+  ["v2: коды ошибок оплаты из detail.code", async () => {
+    for (const [status, code] of [[404, "order_not_found"], [409, "order_not_payable"], [409, "payment_under_review"],
+                                  [503, "payments_disabled"],
+                                  [503, "payment_provider_unavailable"], [429, "rate_limited"]]) {
+      const fetch = fakeFetch(() => jsonResponse(status, { detail: { code, message: "x" } }));
+      await assertApiError(client(fetch, { allowOrderCreation: true }).checkoutV2(1, "c".repeat(43)), code);
+    }
+    const tooBig = fakeFetch(() => jsonResponse(413, { detail: { code: "payload_too_large", message: "x" } }));
+    await assertApiError(client(tooBig).getOrderStatusV2(1, "c".repeat(43)), "payload_too_large");
+  }],
+
+  ["v2: getOrderStatusV2 возвращает статусы заказа, оплаты, исполнения и возврата", async () => {
+    const status = { order: { ...ORDER_V2, status: "paid" }, payment_status: "succeeded", confirmation_url: null,
+                     fulfillment_status: "pending", refund_status: "none" };
+    const fetch = fakeFetch(() => jsonResponse(200, status));
+    assertEqual(await client(fetch).getOrderStatusV2(42, "d".repeat(43)), status);
+    assertEqual(fetch.calls[0].url, "http://127.0.0.1:8000/api/v2/orders/42/status");
+    const broken = fakeFetch(() => jsonResponse(200, { order: null }));
+    await assertApiError(client(broken).getOrderStatusV2(42, "d".repeat(43)), "invalid_response");
+  }],
+
   ["formatMoney: копейки без float", async () => {
     const plain = (text) => text.replace(/\s/g, " ");
     assertEqual(plain(formatMoney(RUB(99950))), "999,50 ₽");

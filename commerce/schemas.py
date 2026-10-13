@@ -68,6 +68,37 @@ class OrderOut(BaseModel):
 
 class OrderCreatedV2(BaseModel):
     order: OrderOut
+    access_token: str = Field(
+        description="Секрет владельца заказа (PR 3). Показывается один раз; нужен для оплаты и статуса.")
+
+
+# ---------- оплата (PR 3) ----------
+
+class OrderAccessIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    access_token: Annotated[str, Field(strict=True, min_length=1, max_length=128)]
+
+
+class CheckoutV2(BaseModel):
+    payment_status: Literal["awaiting_payment"]
+    confirmation_url: Optional[str] = Field(description="Страница оплаты провайдера; перейти по ней покупателю")
+
+
+class OrderStateOut(BaseModel):
+    id: int
+    status: Literal["pending", "paid", "requires_action", "cancelled", "legacy"]
+    created_at: str
+    total: Money
+    items: list[OrderItemOut]
+
+
+class OrderStatusV2(BaseModel):
+    order: OrderStateOut
+    payment_status: Literal["none", "awaiting_payment", "succeeded", "canceled", "failed", "requires_action"]
+    confirmation_url: Optional[str]
+    fulfillment_status: Literal["not_started", "pending", "in_progress", "fulfilled", "requires_action", "cancelled"]
+    refund_status: Literal["none", "pending", "succeeded", "canceled"]
 
 
 class ErrorDetailV2(BaseModel):

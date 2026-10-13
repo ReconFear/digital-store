@@ -56,8 +56,11 @@ def merge_items(items):
     return merged
 
 
-def create_order(items):
+def create_order(items, on_created=None):
     """Создаёт заказ "pending" из позиций [(product_id, quantity), ...].
+
+    on_created(cursor, order_id) — необязательный шаг в ТОЙ ЖЕ транзакции после записи
+    позиций (PR 3: секрет доступа к заказу, payments/access.py). Ошибка в нём отменяет заказ.
 
     Типы и диапазоны входных данных проверяет схема API (commerce/schemas.py);
     здесь — бизнес-правила, которые зависят от состояния базы.
@@ -154,6 +157,9 @@ def create_order(items):
                         currency, line["line_total_minor"],
                     ),
                 )
+
+            if on_created is not None:
+                on_created(cursor, order_id)
 
     return {
         "id": order_id,
