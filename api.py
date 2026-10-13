@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from database import (
     create_order_in_db,
@@ -8,14 +10,35 @@ from database import (
 )
 from cors_settings import cors_middleware_options
 from commerce import catalog as catalog_v2
-from commerce.orders import OrderError, create_order as create_order_v2
-from commerce.schemas import CreateOrderIn, ErrorV2, OrderCreatedV2, ProductListV2, ProductV2
+from commerce.orders import OrderError
+from commerce.schemas import (
+    CheckoutV2,
+    CreateOrderIn,
+    ErrorV2,
+    OrderAccessIn,
+    OrderCreatedV2,
+    OrderStatusV2,
+    ProductListV2,
+    ProductV2,
+)
+from http_security import RequestLimitsMiddleware, client_ip, request_limits_options
+from payments import PaymentServiceError, build_payment_service
+from payments.access import create_order_with_access
 
 app = FastAPI()
+
+# Ограничение частоты и размера запросов (http_security.py). Добавлено ДО CORS, поэтому
+# CORS остаётся внешним слоем и ответы 413/429 тоже получают CORS-заголовки.
+_limits = request_limits_options()
+app.add_middleware(RequestLimitsMiddleware, **_limits)
 
 # Какие frontend-адреса браузер пустит к API. Настраивается переменной
 # CORS_ALLOWED_ORIGINS (см. cors_settings.py). CORS — не защита API.
 app.add_middleware(CORSMiddleware, **cors_middleware_options())
+
+# Платежи (PR 3). По умолчанию выключены: PAYMENTS_ENABLED=false (см. PAYMENTS.md).
+# Неверная конфигурация платежей останавливает запуск — без молчаливого отключения.
+payments_v2 = build_payment_service()
 
 
 class OrderRequest(BaseModel):
@@ -121,10 +144,54 @@ def get_product_v2(product_id: int):
     responses={404: {"model": ErrorV2}, 409: {"model": ErrorV2}, 422: {"model": ErrorV2}},
 )
 def create_order_v2_endpoint(request: CreateOrderIn):
-    # Заказ создаётся в статусе "pending". Оплата и выдача — не здесь.
+    # Заказ создаётся в статусе "pending". Оплата — отдельным запросом checkout.
+    # access_token — секрет владельца заказа (PR 3): показывается один раз, в базе только хэш.
     try:
-        order = create_order_v2([(item.product_id, item.quantity) for item in request.items])
+        order, access_token = create_order_with_access([(item.product_id, item.quantity) for item in request.items])
     except OrderError as error:
         raise HTTPException(status_code=error.http_status, detail=error.as_detail())
 
-    return {"order": order}
+    return {"order": order, "access_token": access_token}
+
+
+# ---------------------------------------------------------------------------
+# Оплата (PR 3). Доступ к заказу — только по паре (id, access_token) в ТЕЛЕ запроса
+# (не в URL: адреса попадают в логи и историю браузера). Неверный секрет и
+# несуществующий заказ неотличимы (404). Оплачен ли заказ, решает только платёжный
+# обработчик по ответу провайдера — ни один из этих маршрутов не делает заказ оплаченным.
+# ---------------------------------------------------------------------------
+
+_PAYMENT_ERRORS = {404: {"model": ErrorV2}, 409: {"model": ErrorV2}, 503: {"model": ErrorV2}}
+
+
+def _payment_error(error):
+    raise HTTPException(status_code=error.http_status, detail=error.as_detail())
+
+
+@app.post("/api/v2/orders/{order_id}/checkout", response_model=CheckoutV2, responses=_PAYMENT_ERRORS)
+def checkout_v2(order_id: int, request: OrderAccessIn):
+    try:
+        return payments_v2.checkout(order_id, request.access_token)
+    except PaymentServiceError as error:
+        _payment_error(error)
+
+
+@app.post("/api/v2/orders/{order_id}/status", response_model=OrderStatusV2, responses={404: {"model": ErrorV2}})
+def order_status_v2(order_id: int, request: OrderAccessIn):
+    try:
+        return payments_v2.order_status(order_id, request.access_token)
+    except PaymentServiceError as error:
+        _payment_error(error)
+
+
+@app.post("/api/v2/payments/yookassa/webhook", include_in_schema=False)
+async def yookassa_webhook(request: Request):
+    # Уведомление только ставится в очередь; ответ 200 — после COMMIT в provider_events.
+    # Ошибка базы -> 500, и ЮKassa повторит доставку. Фиктивного успеха нет.
+    body = await request.body()
+    ip = client_ip(request.scope, _limits["trusted_proxies"])
+    try:
+        await run_in_threadpool(payments_v2.accept_notification, body, ip)
+    except PaymentServiceError as error:
+        return JSONResponse(status_code=error.http_status, content={"detail": error.as_detail()})
+    return {}

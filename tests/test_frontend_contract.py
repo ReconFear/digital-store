@@ -46,6 +46,7 @@ def test_client_uses_only_existing_api_routes():
     assert endpoints == {
         "/products", "/products/{}", "/orders",                          # v1 (без изменений)
         "/api/v2/products", "/api/v2/products/{}", "/api/v2/orders",    # v2 (PR 2)
+        "/api/v2/orders/{}/checkout", "/api/v2/orders/{}/status",        # оплата (PR 3)
     }
     assert endpoints <= _api_routes()
 

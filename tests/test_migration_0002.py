@@ -73,7 +73,11 @@ def migrated(make_schema):
 def test_only_0002_is_applied_to_a_0001_database(migrated):
     conn, before, applied = migrated
 
-    assert [m.version for m in applied] == ["0002"]
+    # 0000 и 0001 повторно не применяются; после 0002 идут только более новые (с PR 3 — 0003).
+    versions = [m.version for m in applied]
+    assert versions[0] == "0002"
+    assert versions == sorted(versions) and all(v > "0001" for v in versions)
+    assert versions == [m.version for m in migrate.discover() if m.version > "0001"]
 
 
 def test_existing_products_keep_all_old_values(migrated):

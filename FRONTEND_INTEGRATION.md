@@ -224,7 +224,7 @@ Remove-Item Env:DB_NAME
 
 3. **Наличие.** Кнопку «В корзину» блокируйте по `available`. Ограничение количества: для `inventory_mode: "tracked"` — не больше `stock_quantity` и не больше 1000; для `unlimited` — не больше 1000.
 
-4. **Оформление.** `createOrderV2(cart)`. Итог, цены и названия на странице «Заказ создан» берите **из ответа сервера** (`order.total`, `order.items`): они могут отличаться от корзины, если цена изменилась. Сохраните ответ — прочитать заказ повторно по API пока нельзя.
+4. **Оформление.** `createOrderV2(cart)`. Итог, цены и названия на странице «Заказ создан» берите **из ответа сервера** (`order.total`, `order.items`): они могут отличаться от корзины, если цена изменилась. Сохраните `order.id` и `accessToken` — по ним заказ можно прочитать снова (`getOrderStatusV2`, PR 3).
 
 5. **Ошибки оформления** — по `error.code`:
 
@@ -254,6 +254,35 @@ try {
   showMessage(error.userMessage);
 }
 ```
+
+## 8а. PR 3: оплата (для Артёма)
+
+Старые методы не менялись. `createOrderV2` теперь возвращает ещё и `accessToken` — секрет владельца заказа:
+
+```js
+const { order, accessToken } = await api.createOrderV2(cart);
+sessionStorage.setItem("lastOrder", JSON.stringify({ id: order.id, accessToken }));  // не в URL!
+```
+
+Новые методы клиента:
+
+| Метод | Что делает |
+|---|---|
+| `api.checkoutV2(orderId, accessToken)` | начать оплату → `{ payment_status: "awaiting_payment", confirmation_url }` (выключен без `allowOrderCreation: true`) |
+| `api.getOrderStatusV2(orderId, accessToken)` | статус: `order.status`, `payment_status`, `fulfillment_status`, `refund_status` |
+
+Сценарий:
+
+1. «Оформить» → `createOrderV2(cart)` → сохранить `{ id, accessToken }` в `sessionStorage`.
+2. «Оплатить» → `checkoutV2(id, accessToken)` → `location.assign(confirmation_url)`. Повторное нажатие безопасно: вернётся та же ссылка.
+3. Страница возврата (`PAYMENT_RETURN_URL`) → взять `{ id, accessToken }` из `sessionStorage` → опрашивать `getOrderStatusV2` раз в 3–5 секунд, пока `payment_status` = `awaiting_payment` (не дольше 2–3 минут).
+4. Тексты: `succeeded` + `order.status = "paid"` → «Оплачено»; `order.status = "requires_action"` → «Оплата получена, магазин свяжется с вами»; `canceled` → «Оплата не прошла» + кнопка «Оплатить снова»; `awaiting_payment` после ожидания → «Ждём подтверждения банка, обновите страницу позже».
+
+Никогда не показывайте «Оплачено» по самому факту возврата с ЮKassa или по ответу `checkoutV2` — только по `getOrderStatusV2`.
+
+Ошибки (`error.code`): `order_not_found` (нет заказа или неверный секрет), `order_not_payable`, `payment_under_review` («Оплата проверяется магазином», кнопку «Оплатить» скрыть), `payments_disabled`, `payment_provider_unavailable` («Повторить через минуту»), `rate_limited`. `confirmation_url = null` в ответе `checkoutV2` — не перенаправлять, показать статус.
+
+Оплата по умолчанию выключена на сервере (`payments_disabled`). Для локальной проверки нужен тестовый магазин ЮKassa (`PAYMENTS.md`, раздел 7) — без него показывайте сообщение об ошибке.
 
 ## 9. Частые проблемы
 

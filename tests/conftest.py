@@ -49,6 +49,13 @@ def _require_test_db(dbname, where):
         )
 
 
+# Ограничение частоты запросов (http_security.py) в общих тестах API выключено: они делают
+# много запросов с одного адреса. Сам ограничитель проверяется отдельно (test_http_security.py)
+# на собственном экземпляре, независимо от этой переменной. Платежи в тестах тоже по
+# умолчанию выключены — сервис с имитатором ЮKassa создают тесты платежей сами.
+os.environ["HTTP_RATE_LIMITS"] = "off"
+os.environ["PAYMENTS_ENABLED"] = "false"
+
 TEST_DB_NAME = os.environ.get("TEST_DB_NAME", "digital_store_test")
 _require_test_db(TEST_DB_NAME, "TEST_DB_NAME")
 os.environ["DB_NAME"] = TEST_DB_NAME
@@ -144,6 +151,9 @@ def make_product():
             )
             order_ids = [row[0] for row in cursor.fetchall()]
             if order_ids:
+                # Платёжные данные PR 3 (тоже защищены; удаляются в той же транзакции уборки).
+                for table in ("refunds", "money_operations", "audit_log", "payments", "order_access"):
+                    cursor.execute(f"DELETE FROM {table} WHERE order_id = ANY(%s)", (order_ids,))
                 cursor.execute(
                     """
                     DELETE FROM fulfillments

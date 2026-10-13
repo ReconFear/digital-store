@@ -70,7 +70,10 @@ def test_cannot_delete_order(shop):
 
 
 def test_cannot_truncate_history_even_with_cascade(shop):
-    _fails(shop, "TRUNCATE order_items, orders, fulfillments", "TRUNCATE")
+    # PR 3: на orders ссылаются платёжные таблицы 0003, поэтому TRUNCATE без CASCADE
+    # PostgreSQL отклоняет ещё до триггера («cannot truncate a table referenced in a
+    # foreign key constraint»); регистр сообщения поэтому не важен.
+    _fails(shop, "TRUNCATE order_items, orders, fulfillments", "(?i)truncate")
     _fails(shop, "TRUNCATE orders CASCADE", "TRUNCATE")
     assert _composition(shop) == [(1, 1, 99900)]
 
@@ -151,7 +154,8 @@ def test_deleting_one_item_of_multi_item_order_fails_at_commit(shop):
 
 def test_truncate_is_refused_even_when_deletion_is_allowed(shop):
     _fails(shop, "SET LOCAL digital_store.allow_history_delete = 'on'; TRUNCATE order_items, orders, fulfillments",
-           "TRUNCATE")
+           "(?i)truncate")  # см. комментарий в test_cannot_truncate_history_even_with_cascade
+    _fails(shop, "SET LOCAL digital_store.allow_history_delete = 'on'; TRUNCATE orders CASCADE", "TRUNCATE")
     assert _composition(shop) == [(1, 1, 99900)]
 
 
@@ -360,6 +364,15 @@ TRIGGER_FUNCTIONS = (
     "order_items_guard_insert", "orders_check_composition",
 )
 
+# Функции миграции 0003 (PR 3).
+PAYMENT_FUNCTIONS_0003 = (
+    "payments_guard", "refunds_guard", "financial_history_protect", "financial_history_protect_truncate",
+    "apply_paid_order", "order_access_issue", "order_status_view", "payment_attempt_start",
+    "payment_attempt_bind", "payment_attempt_mark", "payment_checkout_bind", "payment_checkout_mark",
+    "payment_attempt_touch", "provider_event_accept", "payment_record_provider_state",
+    "admin_resolve_payment", "admin_retry_paid_order", "request_refund",
+)
+
 
 def _schema(conn):
     return _query(conn, "SELECT current_schema()")[0][0]
@@ -467,7 +480,8 @@ def test_trigger_functions_have_trusted_search_path_in_test_schema(shop):
     schema = _schema(shop)
     configs = dict(_query(shop, "SELECT p.proname, array_to_string(p.proconfig, ';') FROM pg_proc p "
                                 "JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = %s", (schema,)))
-    assert set(configs) == set(TRIGGER_FUNCTIONS)
+    # PR 3: в схеме появились функции 0003; у ВСЕХ функций схемы путь должен быть доверенным.
+    assert set(configs) == set(TRIGGER_FUNCTIONS) | set(PAYMENT_FUNCTIONS_0003)
     assert set(configs.values()) == {f"search_path=pg_catalog, {schema}, pg_temp"}
 
 

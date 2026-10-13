@@ -15,6 +15,8 @@
  *   GET  /api/v2/products[?available_only=true] -> { products: ProductV2[], total }
  *   GET  /api/v2/products/{id}                  -> ProductV2
  *   POST /api/v2/orders { items: [{ product_id, quantity }] } -> 201 { order } (pending, БЕЗ оплаты)
+ *   POST /api/v2/orders/{id}/checkout { access_token } -> { payment_status, confirmation_url } (PR 3)
+ *   POST /api/v2/orders/{id}/status   { access_token } -> { order, payment_status, fulfillment_status, ... }
  * ProductV2: { id, name, product_type, inventory_mode, price: Money, stock_quantity: number|null, available }
  * Money: { amount_minor: целое (копейки), currency: "RUB", exponent: 2 }
  *
@@ -35,6 +37,8 @@ export const ENDPOINTS = Object.freeze({
   productsV2: "/api/v2/products",
   productV2: "/api/v2/products/{id}",
   ordersV2: "/api/v2/orders",
+  checkoutV2: "/api/v2/orders/{id}/checkout",
+  orderStatusV2: "/api/v2/orders/{id}/status",
 });
 
 /** Тексты для покупателя. Тема оформления может заменить их своими по полю `code`. */
@@ -53,6 +57,13 @@ export const USER_MESSAGES = Object.freeze({
   mixed_currency: "Эти товары нельзя оформить одним заказом.",
   unsupported_currency: "Этот товар сейчас нельзя заказать.",
   orders_disabled: "Оформление заказов отключено.",
+  order_not_found: "Заказ не найден.",
+  order_not_payable: "Этот заказ уже оплачен, отменён или ожидает проверки.",
+  payment_under_review: "Предыдущая попытка оплаты проверяется магазином. Новая оплата пока невозможна.",
+  payments_disabled: "Оплата временно недоступна.",
+  payment_provider_unavailable: "Платёжная система не ответила. Попробуйте ещё раз через минуту.",
+  rate_limited: "Слишком много запросов. Подождите немного и повторите.",
+  payload_too_large: "Слишком большой запрос.",
   aborted: "Запрос отменён.",
 });
 
@@ -82,10 +93,17 @@ export class DigitalStoreApiError extends Error {
   }
 }
 
-const STATUS_CODES = { 403: "forbidden", 404: "not_found", 409: "unavailable", 422: "validation" };
+const STATUS_CODES = { 403: "forbidden", 404: "not_found", 409: "unavailable", 413: "payload_too_large", 422: "validation", 429: "rate_limited" };
 
 // API v2 сообщает точную причину в detail.code; эти коды клиент передаёт как есть.
-const V2_DETAIL_CODES = ["insufficient_stock", "mixed_currency", "unsupported_currency"];
+const V2_DETAIL_CODES = [
+  "insufficient_stock", "mixed_currency", "unsupported_currency",
+  "order_not_found", "order_not_payable", "payment_under_review", "payments_disabled",
+  "payment_provider_unavailable", "rate_limited",
+];
+
+// Секрет доступа к заказу: 43 символа base64url (выдаётся сервером при создании заказа v2).
+const ACCESS_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
 function normalizeBaseUrl(baseUrl) {
   if (typeof baseUrl !== "string" || !baseUrl.trim()) {
@@ -104,6 +122,23 @@ function normalizeBaseUrl(baseUrl) {
     throw new TypeError("createApiClient: baseUrl не должен содержать параметры, # или логин");
   }
   return url.href.replace(/\/+$/, "");
+}
+
+function checkOrderAccess(method, orderId, accessToken) {
+  if (!isPositiveId(orderId) || typeof accessToken !== "string" || !ACCESS_TOKEN_RE.test(accessToken)) {
+    throw new DigitalStoreApiError("invalid_argument", {
+      message: `${method}: нужен id заказа и accessToken, полученный при создании заказа`,
+    });
+  }
+}
+
+function isHttpsUrl(value) {
+  if (typeof value !== "string") return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function isPositiveId(value) {
@@ -388,7 +423,51 @@ export function createApiClient(options = {}) {
       const body = { items: items.map(({ product_id, quantity }) => ({ product_id, quantity })) };
       const data = await request(ENDPOINTS.ordersV2, { method: "POST", body, signal });
       if (!isOrderV2(data.order)) throw invalidResponse(ENDPOINTS.ordersV2, "неожиданный формат заказа v2");
+      // PR 3: accessToken — секрет владельца заказа. Показывается сервером один раз; сохраните его
+      // (например, в sessionStorage) — без него нельзя оплатить заказ и узнать его статус.
+      if (typeof data.access_token === "string" && ACCESS_TOKEN_RE.test(data.access_token)) {
+        return { order: data.order, accessToken: data.access_token };
+      }
       return { order: data.order };
+    },
+
+    /**
+     * Начать оплату заказа (PR 3). Возвращает адрес страницы оплаты провайдера —
+     * перенаправьте на него покупателя. Оплаченным заказ делает только сервер после
+     * проверки платежа у провайдера; ответ этого метода оплатой НЕ является.
+     * Отключено без allowOrderCreation: true.
+     * @returns {Promise<{ payment_status: "awaiting_payment", confirmation_url: string|null }>}
+     */
+    async checkoutV2(orderId, accessToken, { signal } = {}) {
+      if (!allowOrderCreation) {
+        throw new DigitalStoreApiError("orders_disabled", {
+          message: "checkoutV2 отключён: создайте клиент с allowOrderCreation: true",
+        });
+      }
+      checkOrderAccess("checkoutV2", orderId, accessToken);
+      const path = ENDPOINTS.checkoutV2.replace("{id}", String(orderId));
+      const data = await request(path, { method: "POST", body: { access_token: accessToken }, signal });
+      const url = data.confirmation_url;
+      if (data.payment_status !== "awaiting_payment" || !(url === null || isHttpsUrl(url))) {
+        throw invalidResponse(path, "неожиданный ответ checkout");
+      }
+      return { payment_status: data.payment_status, confirmation_url: url };
+    },
+
+    /**
+     * Статус заказа для его владельца (PR 3): заказ, статус оплаты, исполнения и возврата.
+     * @returns {Promise<{ order, payment_status, confirmation_url, fulfillment_status, refund_status }>}
+     */
+    async getOrderStatusV2(orderId, accessToken, { signal } = {}) {
+      checkOrderAccess("getOrderStatusV2", orderId, accessToken);
+      const path = ENDPOINTS.orderStatusV2.replace("{id}", String(orderId));
+      const data = await request(path, { method: "POST", body: { access_token: accessToken }, signal });
+      const statuses = ["payment_status", "fulfillment_status", "refund_status"];
+      if (!data.order || !isPositiveId(data.order.id) || !isMoney(data.order.total)
+          || !statuses.every((key) => typeof data[key] === "string")) {
+        throw invalidResponse(path, "неожиданный формат статуса заказа");
+      }
+      return data;
     },
   });
 }
