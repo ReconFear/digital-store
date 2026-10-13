@@ -26,6 +26,7 @@ import base64
 import json
 import logging
 import ssl
+import truststore
 import time
 import urllib.error
 import urllib.request
@@ -85,7 +86,7 @@ class YooKassaProvider:
         self._timeout = timeout_seconds
         self._max_attempts = max_attempts
         self._sleep = sleep
-        context = ssl.create_default_context()
+        context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         # _NoRedirect заменяет стандартный обработчик перенаправлений (build_opener не добавляет
         # свой, если передан наследник HTTPRedirectHandler).
