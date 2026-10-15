@@ -13,7 +13,8 @@
   <prefix>_worker    LOGIN. Платёжный обработчик и исполнение заказов (python -m payments.worker).
                      Учитывает оплату только через payment_record_provider_state.
   <prefix>_admin     NOLOGIN-группа для людей: чтение всего, повторное проведение оплаченного
-                     заказа, запрос возврата. Выдаётся конкретным учётным записям (GRANT ... TO).
+                     заказа, запрос возврата, управление цифровыми ключами (PR5). Выдаётся
+                     персональным учётным записям: --part admin-login --login <имя>.
 
 Изменение финансовых статусов и истории — только через SECURITY DEFINER-функции миграции
 0003 (путь поиска закреплён: pg_catalog, <схема>, pg_temp; EXECUTE у PUBLIC отозван).
@@ -42,7 +43,12 @@ APP_FUNCTIONS = (
     "payment_checkout_bind(bigint, bytea, text, text, boolean)",
     "payment_checkout_mark(bigint, bytea, text, text)",
     "provider_event_accept(text, text, text, text)",
+    # PR5: выдача ключей покупателю и проверка версий ключей шифрования
+    "order_delivery_view(integer, bytea)",
+    "encryption_key_check_values()",
 )
+# PR5: продаваемый остаток (каталог и создание заказа). Таблицы ключей веб-роли недоступны.
+APP_SELECT_VIEWS = ("product_sellable_stock",)
 # Обработчик платежей и исполнения: читает попытки и очередь, обновляет очередь и задачи
 # исполнения; учитывает оплату только через payment_record_provider_state.
 WORKER_SELECT = ("products", "orders", "order_items", "fulfillments", "payments", "provider_events")
@@ -51,8 +57,11 @@ WORKER_FUNCTIONS = (
     "payment_attempt_mark(bigint, text, text)",
     "payment_attempt_touch(bigint, text)",
     "payment_record_provider_state(bigint, text, text, bigint, text, boolean, boolean, text, text)",
+    # PR5: назначение ключей задаче (без секретов шифрования) и проверка триггера задач
+    "digital_keys_assign(bigint)",
+    "digital_keys_task_complete(bigint)",
 )
-FULFILLMENT_COLUMNS = "status, attempts, last_error, next_attempt_at, updated_at, fulfilled_at"
+FULFILLMENT_COLUMNS = "status, attempts, last_error, status_note, next_attempt_at, updated_at, fulfilled_at"
 EVENT_COLUMNS = ("status, attempts, last_error, next_attempt_at, processed_at, "
                  "lease_token, lease_expires_at, recheck_requested")
 # Администратор: читает всё, кроме хэшей секретов заказов.
@@ -62,9 +71,27 @@ ADMIN_FUNCTIONS = (
     "admin_retry_paid_order(integer)",
     "request_refund(bigint, bigint, text)",
     "admin_resolve_payment(bigint, text, text)",
+    # PR5 (каждая дополнительно проверяет членство вошедшего в группе администраторов)
+    "admin_import_digital_keys(integer, text, text[], text[], text[], text[], text[], text, boolean)",
+    "admin_withdraw_digital_key(uuid, text)",
+    "admin_resume_fulfillment(bigint, text, boolean)",
+    "admin_cancel_fulfillment(bigint, text)",
+    "admin_reconcile_digital_stock(integer)",
+    "admin_register_encryption_key(text, text, text)",
+    "admin_digital_keys_keyring_sample()",
+    "admin_whoami()",
+    "encryption_key_check_values()",
 )
+ADMIN_SELECT_PR5 = ("digital_key_batches", "encryption_key_registry", "digital_key_stock", "fulfillment_issues",
+                    "product_sellable_stock", "shop_security_settings")
+# Ключи: администратор видит учёт, но не шифротексты, nonce и отпечатки.
+ADMIN_KEY_COLUMNS = ("id, public_id, product_id, batch_id, enc_key_id, fingerprint_key_id, status, fulfillment_id, "
+                     "order_item_id, imported_at, assigned_at, withdrawn_at, withdraw_reason")
 ALL_TABLES = ("products", "orders", "order_items", "fulfillments", "payments", "money_operations",
-              "provider_events", "refunds", "audit_log", "order_access", "schema_migrations")
+              "provider_events", "refunds", "audit_log", "order_access", "schema_migrations",
+              # PR5
+              "shop_security_settings", "encryption_key_registry", "digital_key_batches", "digital_keys",
+              "product_sellable_stock", "digital_key_stock", "fulfillment_issues")
 
 
 def role_names(prefix):
@@ -83,7 +110,7 @@ def grants_sql(schema="public", prefix="digital_store"):
     r = role_names(prefix)
     s = schema
     out = [
-        f"-- Права для схемы {s}. Выполнять после миграции 0003 под владельцем схемы или суперпользователем.",
+        f"-- Права для схемы {s}. Выполнять после миграции 0004 под владельцем схемы или суперпользователем.",
         f"REVOKE ALL ON ALL TABLES IN SCHEMA {s} FROM PUBLIC;",
         f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {s} FROM PUBLIC;",
         f"REVOKE CREATE ON SCHEMA {s} FROM PUBLIC;",
@@ -97,6 +124,7 @@ def grants_sql(schema="public", prefix="digital_store"):
         f"GRANT USAGE ON SEQUENCE {', '.join(f'{s}.{q}' for q in APP_SEQUENCES)} TO {r['app']};",
     ]
     out += [f"GRANT EXECUTE ON FUNCTION {s}.{fn} TO {r['app']};" for fn in APP_FUNCTIONS]
+    out.append(f"GRANT SELECT ON {', '.join(f'{s}.{t}' for t in APP_SELECT_VIEWS)} TO {r['app']};")
     out += [
         "",
         "-- платёжный обработчик и исполнение заказов",
@@ -111,6 +139,15 @@ def grants_sql(schema="public", prefix="digital_store"):
         f"GRANT SELECT ON {', '.join(f'{s}.{t}' for t in ADMIN_SELECT)} TO {r['admin']};",
     ]
     out += [f"GRANT EXECUTE ON FUNCTION {s}.{fn} TO {r['admin']};" for fn in ADMIN_FUNCTIONS]
+    out += [
+        f"GRANT SELECT ON {', '.join(f'{s}.{t}' for t in ADMIN_SELECT_PR5)} TO {r['admin']};",
+        f"GRANT SELECT ({ADMIN_KEY_COLUMNS}) ON {s}.digital_keys TO {r['admin']};",
+        "",
+        "-- PR5: какая группа — администраторы магазина. Проверяется в базе каждой admin_*-функцией",
+        "-- (членство вошедшего с наследованием прав + EXECUTE). Выполнять владельцем схемы (мигратором).",
+        f"INSERT INTO {s}.shop_security_settings (singleton, admin_group) VALUES (TRUE, '{r['admin']}')",
+        f"    ON CONFLICT (singleton) DO UPDATE SET admin_group = EXCLUDED.admin_group, updated_at = now();",
+    ]
     return "\n".join(out) + "\n"
 
 
@@ -140,6 +177,15 @@ SHOP_FUNCTIONS = (
     "payment_attempt_bind", "payment_attempt_mark", "payment_checkout_bind", "payment_checkout_mark",
     "payment_attempt_touch", "provider_event_accept", "payment_record_provider_state",
     "admin_resolve_payment", "admin_retry_paid_order", "request_refund",
+    # 0004 (выдача цифровых ключей)
+    "digital_key_stock_counts", "digital_keys_task_complete", "digital_keys_guard", "digital_keys_protect_truncate",
+    "digital_key_records_protect", "fulfillments_guard", "products_digital_stock_guard",
+    "digital_keys_assign", "order_delivery_view", "encryption_key_check_values", "shop_require_admin",
+    "shop_is_owner_role", "digital_keys_import_core", "digital_keys_withdraw_core", "fulfillment_resume_core",
+    "fulfillment_cancel_core", "digital_stock_reconcile_core", "encryption_key_register_core",
+    "digital_keys_keyring_sample_core", "admin_import_digital_keys", "admin_withdraw_digital_key",
+    "admin_resume_fulfillment", "admin_cancel_fulfillment", "admin_reconcile_digital_stock",
+    "admin_register_encryption_key", "admin_digital_keys_keyring_sample", "admin_whoami",
 )
 
 
@@ -164,7 +210,7 @@ BEGIN
     FOR obj IN
         SELECT format('%I.%I', n.nspname, c.relname)
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = '{schema}' AND c.relkind IN ('r', 'p') AND c.relname IN ({tables})
+        WHERE n.nspname = '{schema}' AND c.relkind IN ('r', 'p', 'v') AND c.relname IN ({tables})
     LOOP
         -- Вместе с таблицей меняется владелец её последовательностей (SERIAL/IDENTITY).
         EXECUTE format('ALTER TABLE %s OWNER TO {migrator}', obj);
@@ -179,6 +225,25 @@ BEGIN
 END
 $$;
 """
+
+
+def admin_login_sql(login, prefix="digital_store"):
+    """Персональная учётная запись администратора (PR5). Пароль — отдельно, вручную.
+
+    WITH INHERIT TRUE, SET FALSE (PostgreSQL 16+): права группы действуют сразу (их и проверяют
+    admin_*-функции: членство с наследованием + EXECUTE), а SET ROLE в группу запрещён. Для
+    PostgreSQL 15 и ниже — DB_ROLES.md, раздел «Администраторы».
+    """
+    _check("prefix", prefix)
+    _check("login", login)
+    group = role_names(prefix)["admin"]
+    if login in role_names(prefix).values():
+        raise ValueError("login: нужна отдельная персональная роль, не роль магазина")
+    return "\n".join([
+        f"-- Администратор {login}. Пароль задать вручную: ALTER ROLE {login} PASSWORD '...';",
+        f"CREATE ROLE {login} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT;",
+        f"GRANT {group} TO {login} WITH INHERIT TRUE, SET FALSE;",
+    ]) + "\n"
 
 
 def database_sql(database, prefix="digital_store"):
@@ -197,8 +262,10 @@ def main(argv=None):
     parser.add_argument("--schema", default="public")
     parser.add_argument("--prefix", default="digital_store")
     parser.add_argument("--database", help="имя базы для REVOKE/GRANT CONNECT (необязательно)")
-    parser.add_argument("--part", choices=("all", "roles", "database", "ownership", "grants"), default="all",
-                        help="all = roles + database (если указана) + grants; ownership — только явно")
+    parser.add_argument("--part", choices=("all", "roles", "database", "ownership", "grants", "admin-login"),
+                        default="all",
+                        help="all = roles + database (если указана) + grants; ownership и admin-login — только явно")
+    parser.add_argument("--login", help="для --part admin-login: имя персональной роли администратора")
     args = parser.parse_args(argv)
     parts = []
     if args.part in ("all", "roles"):
@@ -209,6 +276,10 @@ def main(argv=None):
         parts.append(ownership_sql(args.schema, args.prefix))
     if args.part in ("all", "grants"):
         parts.append(grants_sql(args.schema, args.prefix))
+    if args.part == "admin-login":
+        if not args.login:
+            parser.error("--part admin-login требует --login")
+        parts.append(admin_login_sql(args.login, args.prefix))
     sys.stdout.write("\n".join(parts))
     return 0
 

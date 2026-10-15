@@ -12,10 +12,12 @@
    * до подключения проверяется dbname из аргументов или строки подключения;
    * после подключения проверяется фактическое имя базы (conn.info.dbname).
    Любое подключение не к *_test-базе — это ошибка ещё до первого SQL-запроса.
+   Кроме того, разрешена только ОДНА база — TEST_DB_NAME (PR5 rev4): подключение к другой
+   *_test-базе тоже отклоняется, чтобы тесты не переключались между тестовыми базами.
 
-Взаимодействие с monkeypatch: тесты могут, как и раньше, делать
-monkeypatch.setenv("DB_NAME", "digital_store_test") — это совместимо.
-Если тест выставит DB_NAME=digital_store, подключение будет отклонено.
+Взаимодействие с monkeypatch: тесты не должны выставлять DB_NAME сами — база задаётся
+только TEST_DB_NAME. Если тест выставит DB_NAME=digital_store или другую *_test-базу,
+подключение будет отклонено.
 По окончании теста monkeypatch вернёт DB_NAME к тестовому значению.
 
 ВАЖНО: это программная страховка, а не изоляция. Она не заменяет отдельную роль
@@ -55,6 +57,12 @@ def _require_test_db(dbname, where):
 # умолчанию выключены — сервис с имитатором ЮKassa создают тесты платежей сами.
 os.environ["HTTP_RATE_LIMITS"] = "off"
 os.environ["PAYMENTS_ENABLED"] = "false"
+# PR5: настоящие секреты цифровых ключей и учётные данные администратора из .env в тесты не
+# попадают. Пустое значение не перезаписывается load_dotenv(); тесты задают тестовые секреты явно.
+for _name in ("DIGITAL_KEYS_ENCRYPTION_KEYS", "DIGITAL_KEYS_ACTIVE_KEY", "DIGITAL_KEYS_FINGERPRINT_KEY",
+              "DIGITAL_KEYS_SECRETS_FILE", "FULFILLMENT_MODULES", "ADMIN_DB_USER", "ADMIN_DB_PASSWORD",
+              "ADMIN_DB_HOST", "ADMIN_DB_PORT", "ADMIN_DB_NAME"):
+    os.environ[_name] = ""
 
 TEST_DB_NAME = os.environ.get("TEST_DB_NAME", "digital_store_test")
 _require_test_db(TEST_DB_NAME, "TEST_DB_NAME")
@@ -63,13 +71,25 @@ os.environ["DB_NAME"] = TEST_DB_NAME
 _original_connect = psycopg.connect
 
 
+def _require_selected_test_db(dbname, where):
+    """Только ОДНА тестовая база на прогон — TEST_DB_NAME. Другая *_test-база (например, старая
+    digital_store_test при TEST_DB_NAME=digital_store_roles_test) тоже отклоняется: иначе тест,
+    выставивший DB_NAME сам, незаметно проверял бы другую базу с другой схемой и данными."""
+    _require_test_db(dbname, where)
+    if dbname != TEST_DB_NAME:
+        raise ProductionDatabaseAccessError(
+            f"Предохранитель тестов: подключение к базе {dbname!r} запрещено ({where}). "
+            f"В этом прогоне разрешена только тестовая база TEST_DB_NAME={TEST_DB_NAME!r}."
+        )
+
+
 def _guarded_connect(conninfo="", *args, **kwargs):
     requested = psycopg.conninfo.conninfo_to_dict(conninfo, **kwargs).get("dbname")
-    _require_test_db(requested, "до подключения")
+    _require_selected_test_db(requested, "до подключения")
 
     conn = _original_connect(conninfo, *args, **kwargs)
     try:
-        _require_test_db(conn.info.dbname, "после подключения")
+        _require_selected_test_db(conn.info.dbname, "после подключения")
     except ProductionDatabaseAccessError:
         conn.close()
         raise
@@ -154,6 +174,12 @@ def make_product():
                 # Платёжные данные PR 3 (тоже защищены; удаляются в той же транзакции уборки).
                 for table in ("refunds", "money_operations", "audit_log", "payments", "order_access"):
                     cursor.execute(f"DELETE FROM {table} WHERE order_id = ANY(%s)", (order_ids,))
+            # PR5: ключи (ссылаются на задачи, позиции и партии) и партии — до задач и товаров.
+            cursor.execute("DELETE FROM digital_keys WHERE product_id = ANY(%s)", (created,))
+            cursor.execute("DELETE FROM digital_key_batches WHERE product_id = ANY(%s)", (created,))
+            cursor.execute("DELETE FROM audit_log WHERE order_id IS NULL AND (details->>'product_id')::int = ANY(%s)",
+                           (created,))
+            if order_ids:
                 cursor.execute(
                     """
                     DELETE FROM fulfillments
@@ -164,6 +190,24 @@ def make_product():
                 cursor.execute("DELETE FROM order_items WHERE order_id = ANY(%s)", (order_ids,))
                 cursor.execute("DELETE FROM orders WHERE id = ANY(%s)", (order_ids,))
             cursor.execute("DELETE FROM products WHERE id = ANY(%s)", (created,))
+
+
+@pytest.fixture
+def v1_product(shared_test_connection):
+    """v1_product(price=999, quantity=10, is_for_sale=True) -> id товара формата API v1 (цена в целых
+    рублях, учёт остатка), созданного в транзакции shared_test_connection (в конце откатывается).
+    Старые тесты v1 опираются на него, а не на товары № 1/№ 2 из seed.sql."""
+    import uuid
+
+    def factory(price=999, quantity=10, is_for_sale=True):
+        with shared_test_connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO products (name, price, quantity, is_for_sale) VALUES (%s, %s, %s, %s) RETURNING id",
+                (f"pytest-v1-{uuid.uuid4().hex[:8]}", price, quantity, is_for_sale),
+            )
+            return cursor.fetchone()[0]
+
+    return factory
 
 
 @pytest.fixture

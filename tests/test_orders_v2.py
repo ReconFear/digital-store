@@ -8,6 +8,7 @@ import pytest
 import database
 from commerce import catalog
 from commerce.orders import OrderError, create_order
+from digital_keys_testkit import stock_keys
 
 
 def _product(conn, *, name="PR2 product", price_minor=10000, currency="RUB", quantity=10,
@@ -44,8 +45,10 @@ def _orders_count(conn):
 
 def test_order_with_several_products_is_computed_on_server(shared_test_connection):
     conn = shared_test_connection
-    key = _product(conn, name="Key", price_minor=99900, quantity=5, product_type="digital_key",
+    # PR5: остаток товара с автоматической выдачей обеспечен ключами (5 ключей -> quantity 5).
+    key = _product(conn, name="Key", price_minor=99900, quantity=0, product_type="digital_key",
                    fulfillment_type="digital_keys")
+    stock_keys(key, 5, conn=conn)
     book = _product(conn, name="E-book", price_minor=49950, quantity=0, product_type="digital_file",
                     inventory_mode="unlimited", fulfillment_type="downloads")
     consult = _product(conn, name="Consultation", price_minor=300000, quantity=0, product_type="service",
@@ -172,14 +175,16 @@ def test_empty_order_is_rejected():
 
 def test_v1_order_is_stored_in_the_universal_model(shared_test_connection):
     conn = shared_test_connection
+    # Свой товар формата v1 (не товар № 1 из seed.sql): цена 999 ₽ = 99900 копеек.
+    pid = _product(conn, name="V1 product", price_minor=99900, quantity=5)
 
-    result = database.create_order_in_db(1)
+    result = database.create_order_in_db(pid)
 
     assert set(result) == {"id", "product_id", "price", "status"}
-    assert (result["product_id"], result["price"], result["status"]) == (1, 999, "pending")
+    assert (result["product_id"], result["price"], result["status"]) == (pid, 999, "pending")
     assert _one(conn, "SELECT currency, total_minor FROM orders WHERE id = %s", (result["id"],)) == ("RUB", 99900)
     assert _all(conn, "SELECT product_id, quantity, unit_price_minor FROM order_items WHERE order_id = %s",
-                (result["id"],)) == [(1, 1, 99900)]
+                (result["id"],)) == [(pid, 1, 99900)]
 
 
 def test_v1_catalog_shows_only_products_it_can_describe(shared_test_connection):

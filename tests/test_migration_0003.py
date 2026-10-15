@@ -101,20 +101,23 @@ def test_old_migration_checksums_are_unchanged():
 
 
 def test_new_migration_is_last_and_checksummed():
+    # PR5: после 0003 идёт 0004 (проверка «последняя миграция» — в test_migration_0004.py).
     versions = [m.version for m in migrate.discover()]
-    assert versions == ["0000", "0001", "0002", "0003"]
-    m = migrate.discover()[-1]
+    assert versions[:4] == ["0000", "0001", "0002", "0003"]
+    m = migrate.discover()[3]
     assert m.checksum == hashlib.sha256(migrate._normalize(m.path.read_bytes()).encode("utf-8")).hexdigest()
 
 
 # ---------- 15. 0002 -> 0003 с сохранением данных ----------
 
-def test_upgrade_from_0002_applies_only_0003_and_keeps_products_and_orders(at_0002):
+def test_upgrade_from_0002_applies_only_0003_and_keeps_products_and_orders(at_0002, tmp_path):
     conn, _ = at_0002
     before = _snapshot(conn)
     journal_before = _query(conn, "SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version")
 
-    applied = migrate.apply_migrations(conn, log=_quiet)
+    # PR5: переход 0002 -> 0003 проверяется на наборе миграций до 0003 (0004 добавляет столбцы
+    # в fulfillments; переход 0003 -> 0004 — в test_migration_0004.py).
+    applied = migrate.apply_migrations(conn, _dir_until(tmp_path, "0003"), log=_quiet)
 
     assert [m.version for m in applied] == ["0003"]
     assert _snapshot(conn) == before
@@ -163,9 +166,10 @@ def test_apply_paid_order_matches_python_behaviour_of_pr2(at_0002):
 
 # ---------- безопасность функций ----------
 
-def test_security_definer_functions_and_public_execute(at_0002):
+def test_security_definer_functions_and_public_execute(at_0002, tmp_path):
     conn, schema = at_0002
-    migrate.apply_migrations(conn, log=_quiet)
+    # PR5: состав функций 0003; функции 0004 — в test_migration_0004.py.
+    migrate.apply_migrations(conn, _dir_until(tmp_path, "0003"), log=_quiet)
     rows = _query(conn, """
         SELECT p.proname, p.prosecdef, coalesce(array_to_string(p.proacl, ','), ''),
                array_to_string(p.proconfig, ';')

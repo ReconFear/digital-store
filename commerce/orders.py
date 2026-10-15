@@ -82,9 +82,10 @@ def create_order(items, on_created=None):
 
     with database.get_connection() as conn:
         with conn.cursor() as cursor:
+            # Продаваемый остаток (PR5) — подсказка покупателю. Гарантию даёт apply_paid_order при оплате.
             cursor.execute(
-                """
-                SELECT id, name, price_minor, currency, quantity, is_for_sale,
+                f"""
+                SELECT id, name, price_minor, currency, {database.SELLABLE_QUANTITY}, is_for_sale,
                        inventory_mode, product_type, fulfillment_type
                 FROM products
                 WHERE id = ANY(%s)

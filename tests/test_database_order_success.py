@@ -1,31 +1,14 @@
-from contextlib import contextmanager
+"""Заказ v1 на свой товар; всё откатывается (shared_test_connection)."""
 
 import database
 
 
-def test_successful_order_with_rollback(monkeypatch):
-    monkeypatch.setenv("DB_NAME", "digital_store_test")
+def test_successful_order_with_rollback(shared_test_connection, v1_product):
+    product_id = v1_product(price=999, quantity=5)
 
-    real_get_connection = database.get_connection
+    result = database.create_order_in_db(product_id)
 
-    @contextmanager
-    def rollback_connection():
-        conn = real_get_connection()
-
-        try:
-            yield conn
-        finally:
-            conn.rollback()
-            conn.close()
-
-    monkeypatch.setattr(
-        database,
-        "get_connection",
-        rollback_connection
-    )
-
-    result = database.create_order_in_db(1)
-
-    assert result["product_id"] == 1
+    assert result["product_id"] == product_id
     assert result["price"] == 999
+    assert result["status"] == "pending"
     assert "id" in result

@@ -10,6 +10,7 @@ import pytest
 
 import payment_service
 from commerce import fulfillment
+from digital_keys_testkit import stock_keys
 from commerce.fulfillment import FulfillmentError, FulfillmentResult
 from commerce.orders import create_order
 
@@ -49,7 +50,13 @@ def paid_order(make_product):
     def factory(fulfillment_type="manual", product_type="other", count=1):
         items = []
         for _ in range(count):
-            pid = make_product(quantity=5, product_type=product_type, fulfillment_type=fulfillment_type)
+            if fulfillment_type == "digital_keys":
+                # PR5: товар с автоматической выдачей продаётся только при свободных ключах
+                # (остаток 5 обеспечивается загрузкой 5 ключей).
+                pid = make_product(quantity=0, product_type=product_type, fulfillment_type=fulfillment_type)
+                stock_keys(pid, 5)
+            else:
+                pid = make_product(quantity=5, product_type=product_type, fulfillment_type=fulfillment_type)
             items.append((pid, 1))
         order = create_order(items)
         assert payment_service.apply_verified_payment(order["id"])["status"] == "paid"
@@ -79,8 +86,10 @@ def test_without_modules_nothing_is_marked_fulfilled(paid_order, db_value):
 
 
 def test_fulfilled_only_when_module_reports_real_action(paid_order, handler, db_value):
-    order_id = paid_order(fulfillment_type="digital_keys", product_type="digital_key")
-    h = handler("digital_keys", lambda task: FulfillmentResult.fulfilled("ключ выдан"))
+    # PR5: тип downloads (поддельный модуль). Для digital_keys «выполнено» без назначенных ключей
+    # база не примет — см. test_db_rejects_fulfilled_digital_keys_without_keys.
+    order_id = paid_order(fulfillment_type="downloads", product_type="digital_file")
+    h = handler("downloads", lambda task: FulfillmentResult.fulfilled("файл открыт"))
 
     summary = fulfillment.process_pending_fulfillments()
 
@@ -350,3 +359,25 @@ def test_parallel_workers_with_database_errors_count_each_attempt_once(paid_orde
             status, attempts, error = state.split(":", 2)
             assert (status, attempts) == ("pending", "1")
             assert "должно откатиться" not in error
+
+
+def test_note_is_stored_as_public_status_note(paid_order, handler, db_value):
+    order_id = paid_order()
+    handler("manual", lambda task: FulfillmentResult.requires_action("нужен оператор"))
+
+    fulfillment.process_pending_fulfillments()
+
+    assert db_value("""SELECT f.status_note FROM fulfillments f JOIN order_items i ON i.id = f.order_item_id
+                       WHERE i.order_id = %s""", (order_id,)) == "нужен оператор"
+
+
+def test_db_rejects_fulfilled_digital_keys_without_keys(paid_order, handler, db_value):
+    """PR5: модуль, сообщивший «выполнено» без назначения ключей, не делает задачу выполненной;
+    воркер не падает, попытка учитывается как неудачная."""
+    order_id = paid_order(fulfillment_type="digital_keys", product_type="digital_key")
+    handler("digital_keys", lambda task: FulfillmentResult.fulfilled("ключ выдан"))
+
+    summary = fulfillment.process_pending_fulfillments(retry_delay_seconds=0)
+
+    assert summary["fulfilled"] == 0 and summary["retry"] == 1
+    assert _tasks(db_value, order_id) == ["pending:1:результат модуля отклонён проверкой базы"]

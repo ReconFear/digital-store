@@ -21,7 +21,13 @@ from commerce.schemas import (
     ProductListV2,
     ProductV2,
 )
-from http_security import RequestLimitsMiddleware, client_ip, request_limits_options
+from commerce.digital_keys.delivery import DeliveryError, get_delivery
+from http_security import (
+    RequestLimitsMiddleware,
+    SensitiveResponseHeadersMiddleware,
+    client_ip,
+    request_limits_options,
+)
 from payments import PaymentServiceError, build_payment_service
 from payments.access import create_order_with_access
 
@@ -31,6 +37,8 @@ app = FastAPI()
 # CORS остаётся внешним слоем и ответы 413/429 тоже получают CORS-заголовки.
 _limits = request_limits_options()
 app.add_middleware(RequestLimitsMiddleware, **_limits)
+# Ответы маршрута выдачи ключей (в том числе 404/429/503) — с запретом кэширования (PR5).
+app.add_middleware(SensitiveResponseHeadersMiddleware)
 
 # Какие frontend-адреса браузер пустит к API. Настраивается переменной
 # CORS_ALLOWED_ORIGINS (см. cors_settings.py). CORS — не защита API.
@@ -182,6 +190,26 @@ def order_status_v2(order_id: int, request: OrderAccessIn):
         return payments_v2.order_status(order_id, request.access_token)
     except PaymentServiceError as error:
         _payment_error(error)
+
+
+# ---------------------------------------------------------------------------
+# Выдача цифровых ключей (PR5). Контракт — FRONTEND_DELIVERY_API.md. Секрет заказа — в теле.
+# Ключи — только оплаченного заказа и выполненной задачи; ни запрос, ни ответ не логируются.
+# ---------------------------------------------------------------------------
+
+_NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache", "X-Content-Type-Options": "nosniff",
+             "Referrer-Policy": "no-referrer"}
+
+
+@app.post("/api/v2/orders/{order_id}/delivery",
+          responses={404: {"model": ErrorV2}, 503: {"model": ErrorV2}})
+def order_delivery_v2(order_id: int, request: OrderAccessIn):
+    try:
+        body = get_delivery(order_id, request.access_token)
+    except DeliveryError as error:
+        return JSONResponse(status_code=error.http_status, content={"detail": error.as_detail()},
+                            headers=_NO_STORE)
+    return JSONResponse(content=body, headers=_NO_STORE)
 
 
 @app.post("/api/v2/payments/yookassa/webhook", include_in_schema=False)
