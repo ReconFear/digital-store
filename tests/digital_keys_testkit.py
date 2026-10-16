@@ -248,20 +248,19 @@ def _roles_allowed():
     return None
 
 
-def _cleanup_roles(created, group_created, schema, settings_inserted):
+def _cleanup_roles(created, group_created, revokes, settings_inserted):
+    """Отзывает РОВНО выданные фикстурой права (в обратном порядке) и удаляет созданные роли.
+
+    Массовые REVOKE ... ON ALL FUNCTIONS IN SCHEMA здесь не используются: они превращают ACL «по
+    умолчанию» (NULL) всех функций схемы в явный список — права те же, но объекты базы меняются
+    (это поймала проверка инвариантов CI)."""
     conn = database.get_connection()
     try:
         with conn.cursor() as cur:
-            for name in created:
-                cur.execute(f"REVOKE ALL ON SCHEMA {schema} FROM {name}")
-                cur.execute(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM {name}")
-                cur.execute(f"REVOKE CONNECT ON DATABASE {one('SELECT current_database()')} FROM {name}")
+            for statement in reversed(revokes):
+                cur.execute(statement)
             if settings_inserted:
                 cur.execute("DELETE FROM shop_security_settings WHERE admin_group = %s", (group_created,))
-            if group_created:
-                cur.execute(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM {group_created}")
-                cur.execute(f"REVOKE ALL ON SCHEMA {schema} FROM {group_created}")
-                cur.execute(f"REVOKE CONNECT ON DATABASE {one('SELECT current_database()')} FROM {group_created}")
         conn.commit()
         with conn.cursor() as cur:
             for name in list(created) + ([group_created] if group_created else []):
@@ -288,7 +287,13 @@ def shop_admin_factory():
         _pytest.skip(reason)
     schema = one("SELECT current_schema()")
     tag = f"dst_t{_secrets.token_hex(4)}"
-    created, state = [], {"group": None, "settings": False}
+    database_name = one("SELECT current_database()")
+    created, revokes, state = [], [], {"group": None, "settings": False}
+
+    def grant(privilege_on, role):
+        """GRANT с запоминанием точного обратного REVOKE для очистки."""
+        q(f"GRANT {privilege_on} TO {role}")
+        revokes.append(f"REVOKE {privilege_on} FROM {role}")
 
     def group():
         configured = one("SELECT admin_group FROM shop_security_settings")
@@ -300,10 +305,10 @@ def shop_admin_factory():
         name = f"{tag}_admins"   # имя группы не совпадает ни с одной создаваемой LOGIN-ролью
         q(f"CREATE ROLE {name} NOLOGIN")
         state["group"] = name
-        q(f"GRANT USAGE ON SCHEMA {schema} TO {name}")
-        q(f"GRANT CONNECT ON DATABASE {one('SELECT current_database()')} TO {name}")
+        grant(f"USAGE ON SCHEMA {schema}", name)
+        grant(f"CONNECT ON DATABASE {database_name}", name)
         for fn in _ADMIN_PR5_FUNCTIONS:
-            q(f"GRANT EXECUTE ON FUNCTION {schema}.{fn} TO {name}")
+            grant(f"EXECUTE ON FUNCTION {schema}.{fn}", name)
         q("INSERT INTO shop_security_settings (singleton, admin_group) VALUES (TRUE, %s)", (name,))
         state["settings"] = True
         return name
@@ -322,16 +327,16 @@ def shop_admin_factory():
                 _pytest.skip(f"текущая роль не может выдать членство в группе администраторов: {exc}")
         else:
             # Посторонняя роль: может войти и видит схему, членства в группе нет.
-            q(f"GRANT CONNECT ON DATABASE {one('SELECT current_database()')} TO {name}")
-            q(f"GRANT USAGE ON SCHEMA {schema} TO {name}")
+            grant(f"CONNECT ON DATABASE {database_name}", name)
+            grant(f"USAGE ON SCHEMA {schema}", name)
             for fn in extra_execute:
-                q(f"GRANT EXECUTE ON FUNCTION {schema}.{fn} TO {name}")
+                grant(f"EXECUTE ON FUNCTION {schema}.{fn}", name)
         return ShopAdmin(name, password, schema)
 
     try:
         yield login
     finally:
-        _cleanup_roles(created, state["group"], schema, state["settings"])
+        _cleanup_roles(created, state["group"], revokes, state["settings"])
 
 
 @_pytest.fixture

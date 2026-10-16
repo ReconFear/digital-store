@@ -1,0 +1,144 @@
+# CI Digital Store: полный pytest на PostgreSQL 18 с моделью ролей из DB_ROLES.md.
+#
+# Безопасность:
+#  * permissions: только чтение кода; секреты репозитория не используются;
+#  * только pull_request (код PR выполняется без секретов и с read-only токеном), НЕ pull_request_target;
+#  * PostgreSQL — одноразовый service-контейнер на раннере. Пароль его суперпользователя ниже —
+#    публичное тестовое значение одноразового контейнера, а не секрет; рабочие базы и .env не используются;
+#  * роли магазина создаются заново в контейнере; пароль мигратора случайный и не выводится;
+#  * workflow не делает коммитов, push, merge и развёртывания.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches-ignore: [master]   # рабочие ветки; master проверяется через pull_request
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: pytest (Python 3.14, PostgreSQL 18)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-disposable-postgres   # только для этого одноразового контейнера
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # Подключение тестов: суперпользователь ОДНОРАЗОВОГО контейнера (нужен тестам прав для создания
+      # временных ролей и выдачи им CONNECT; так же проверялось на Windows). Никаких внешних баз.
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASSWORD: ci-disposable-postgres
+      DB_NAME: digital_store_roles_test
+      TEST_DB_NAME: digital_store_roles_test
+      DS_TEST_CREATE_ROLES: "1"
+      DS_TEST_SUPERUSER: postgres
+      DS_TEST_SUPERUSER_PASSWORD: ci-disposable-postgres
+      CI_ROLE_PREFIX: ci_shop          # нестандартный префикс ролей — проверка его поддержки
+      PAYMENTS_ENABLED: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0               # для git diff --check относительно базовой ветки
+          persist-credentials: false   # токен не остаётся в .git/config
+
+      - name: Whitespace check (git diff --check)
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+          elif [ -n "${PUSH_BEFORE_SHA:-}" ] && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
+          else
+            base="$(git merge-base HEAD origin/master 2>/dev/null || git rev-list --max-parents=0 HEAD | tail -n 1)"
+          fi
+          echo "Проверяются изменения $base..HEAD"
+          # cr-at-eol: файлы проекта в CRLF (Windows) — CR в конце строки не считается ошибкой.
+          git -c core.whitespace=cr-at-eol diff --check "$base" HEAD
+
+      - name: No secrets files in the repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]*$|\.dump$|\.backup$' | grep -v '\.env\.example$'; then
+            echo "В репозитории есть файлы окружения или дампы — удалите их" >&2
+            exit 1
+          fi
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies (requirements.txt)
+        run: python -m pip install -r requirements.txt
+
+      - name: Verify real psycopg (no stubs)
+        run: |
+          python - <<'PY'
+          import psycopg, sys
+          impl = psycopg.pq.__impl__
+          print("Python", sys.version.split()[0], "| psycopg", psycopg.__version__, "| implementation", impl,
+                "| libpq", psycopg.pq.version())
+          assert impl in ("binary", "c"), f"ожидалась бинарная реализация psycopg, получено {impl}"
+          PY
+
+      - name: Prepare PostgreSQL test database (DB_ROLES.md model)
+        timeout-minutes: 5
+        run: >-
+          python ci/prepare_test_db.py
+          --database "$TEST_DB_NAME"
+          --prefix "$CI_ROLE_PREFIX"
+          --baseline "$RUNNER_TEMP/ci-db-baseline.json"
+
+      - name: Run full test suite
+        timeout-minutes: 20
+        run: python -m pytest -q -ra tests --junitxml="$RUNNER_TEMP/junit.xml"
+
+      - name: Require all tests passed (no skip / xfail)
+        if: ${{ !cancelled() }}
+        run: python ci/check_junit.py "$RUNNER_TEMP/junit.xml" --min-tests 780
+
+      - name: Security invariants after tests
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: >-
+          python ci/check_test_db.py
+          --database "$TEST_DB_NAME"
+          --prefix "$CI_ROLE_PREFIX"
+          --baseline "$RUNNER_TEMP/ci-db-baseline.json"
