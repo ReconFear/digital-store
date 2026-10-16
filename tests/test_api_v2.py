@@ -96,9 +96,11 @@ def test_there_is_no_way_to_read_or_pay_orders_over_http(client):
     assert client.get("/orders").status_code == 403
 
 
-def test_v1_contract_is_unchanged(client):
+def test_v1_contract_is_unchanged(client, v1_product):
+    # Свой товар в транзакции shared_test_connection (откатывается), а не товар № 1 из seed.sql.
+    product_id = v1_product(price=999, quantity=3)
     products = client.get("/products").json()
-    created = client.post("/orders", json={"product_id": 1})
+    created = client.post("/orders", json={"product_id": product_id})
 
     assert set(products) == {"products", "total"}
     assert all(set(p) == {"id", "name", "price", "quantity", "is_for_sale"} for p in products["products"])

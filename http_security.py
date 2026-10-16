@@ -40,6 +40,8 @@ DEFAULT_RULES = (
     RateRule("orders_create", frozenset({"POST"}), re.compile(r"^/(?:api/v2/)?orders/?$"), 10),
     RateRule("checkout", frozenset({"POST"}), re.compile(r"^/api/v2/orders/[^/]+/checkout/?$"), 10),
     RateRule("order_status", frozenset({"POST"}), re.compile(r"^/api/v2/orders/[^/]+/status/?$"), 60),
+    # PR5: получение ключей — 20 в минуту на адрес (каждый показ ещё и пишется в audit_log).
+    RateRule("order_delivery", frozenset({"POST"}), re.compile(r"^/api/v2/orders/[^/]+/delivery/?$"), 20),
     RateRule("provider_webhook", frozenset({"POST"}), re.compile(r"^/api/v2/payments/[^/]+/webhook/?$"), 600),
     RateRule("any", frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"}),
              re.compile(r"^/"), 600),
@@ -197,6 +199,39 @@ class RequestLimitsMiddleware:
             return await receive()
 
         await self.app(scope, replay, send)
+
+
+# Ответы с секретами покупателя (ключи товара) не должны оседать в кэшах браузера и прокси.
+SENSITIVE_PATH = re.compile(r"^/api/v2/orders/[^/]+/delivery/?$")
+SENSITIVE_HEADERS = (
+    (b"cache-control", b"no-store"),
+    (b"pragma", b"no-cache"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+)
+
+
+class SensitiveResponseHeadersMiddleware:
+    """Добавляет запрет кэширования ко ВСЕМ ответам маршрута выдачи (200, 404, 422, 429, 503, 500)."""
+
+    def __init__(self, app, path=SENSITIVE_PATH):
+        self.app = app
+        self.path = path
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not self.path.match(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+        names = {name for name, _ in SENSITIVE_HEADERS}
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = [(n, v) for n, v in message.get("headers", []) if n.lower() not in names]
+                headers.extend(SENSITIVE_HEADERS)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 def request_limits_options(env=None):

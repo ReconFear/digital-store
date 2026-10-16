@@ -1,44 +1,19 @@
-from contextlib import contextmanager
+"""Заказ «pending» не уменьшает остаток. Свой товар, откат в конце."""
 
 import database
 
 
-def test_pending_order_does_not_reduce_stock(monkeypatch):
-    monkeypatch.setenv("DB_NAME", "digital_store_test")
+def _quantity(conn, product_id):
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT quantity FROM products WHERE id = %s", (product_id,))
+        return cursor.fetchone()[0]
 
-    real_get_connection = database.get_connection
-    quantities = {}
 
-    @contextmanager
-    def test_connection():
-        conn = real_get_connection()
+def test_pending_order_does_not_reduce_stock(shared_test_connection, v1_product):
+    product_id = v1_product(price=999, quantity=5)
+    before = _quantity(shared_test_connection, product_id)
 
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT quantity FROM products WHERE id = 1"
-                )
-                quantities["before"] = cursor.fetchone()[0]
-
-            yield conn
-
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT quantity FROM products WHERE id = 1"
-                )
-                quantities["after"] = cursor.fetchone()[0]
-
-        finally:
-            conn.rollback()
-            conn.close()
-
-    monkeypatch.setattr(
-        database,
-        "get_connection",
-        test_connection
-    )
-
-    result = database.create_order_in_db(1)
+    result = database.create_order_in_db(product_id)
 
     assert result["status"] == "pending"
-    assert quantities["before"] == quantities["after"]
+    assert _quantity(shared_test_connection, product_id) == before == 5

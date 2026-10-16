@@ -43,9 +43,22 @@ def test_direct_psycopg_connect_is_guarded():
         psycopg.connect("dbname=digital_store")
 
 
-def test_monkeypatch_to_test_database_still_works(monkeypatch):
-    # Старые тесты делают именно так — это должно оставаться разрешённым.
-    monkeypatch.setenv("DB_NAME", "digital_store_test")
+def test_monkeypatch_to_selected_test_database_still_works(monkeypatch):
+    # Явная установка той же базы, что выбрана TEST_DB_NAME, разрешена.
+    import conftest
+    monkeypatch.setenv("DB_NAME", conftest.TEST_DB_NAME)
 
     with database.get_connection() as conn:
-        assert conn.info.dbname == "digital_store_test"
+        assert conn.info.dbname == conftest.TEST_DB_NAME
+
+
+def test_other_test_database_is_refused(monkeypatch):
+    """Другая *_test-база в том же прогоне запрещена (PR5 rev4): тесты не переключаются между базами.
+    Отказ — до сетевого обращения, поэтому существование базы не важно."""
+    import conftest
+    other = "digital_store_roles_test" if conftest.TEST_DB_NAME != "digital_store_roles_test" else "digital_store_test"
+    monkeypatch.setenv("DB_NAME", other)
+    with pytest.raises(RuntimeError, match="разрешена только тестовая база TEST_DB_NAME"):
+        database.get_connection()
+    with pytest.raises(RuntimeError, match="разрешена только тестовая база TEST_DB_NAME"):
+        psycopg.connect(dbname=other)

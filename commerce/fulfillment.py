@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import Optional, Protocol
 
 import psycopg
+import psycopg.errors
 
 import database
 
@@ -66,7 +67,7 @@ class FulfillmentTask:
 @dataclass(frozen=True)
 class FulfillmentResult:
     status: str
-    note: Optional[str] = None  # публичное пояснение, без секретов
+    note: Optional[str] = None  # публичное пояснение, без секретов (сохраняется в status_note, PR5)
 
     def __post_init__(self):
         if self.status not in _RESULT_STATUSES:
@@ -127,6 +128,11 @@ def _safe_error(exc):
     if isinstance(exc, FulfillmentError):
         return exc.public_message
     return f"{type(exc).__name__} (подробности — в журнале модуля)"
+
+
+def _safe_note(note):
+    """Публичное пояснение результата (миграция 0004, fulfillments.status_note): до 300 символов."""
+    return None if note is None else str(note)[:300]
 
 
 def _claim_next(cursor, types, skip_ids):
@@ -249,20 +255,36 @@ def process_pending_fulfillments(limit=20, max_attempts=5, retry_delay_seconds=3
                     summary["failed" if status == "failed" else "retry"] += 1
                 continue
 
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE fulfillments
-                    SET status = %s,
-                        attempts = attempts + 1,
-                        last_error = NULL,
-                        next_attempt_at = NULL,
-                        updated_at = now(),
-                        fulfilled_at = CASE WHEN %s = 'fulfilled' THEN now() ELSE NULL END
-                    WHERE id = %s
-                    """,
-                    (result.status, result.status, task.id),
-                )
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE fulfillments
+                        SET status = %s,
+                            attempts = attempts + 1,
+                            last_error = NULL,
+                            status_note = %s,
+                            next_attempt_at = NULL,
+                            updated_at = now(),
+                            fulfilled_at = CASE WHEN %s = 'fulfilled' THEN now() ELSE NULL END
+                        WHERE id = %s
+                        """,
+                        (result.status, _safe_note(result.note), result.status, task.id),
+                    )
+            except psycopg.errors.RaiseException:
+                # Результат модуля отклонён проверками базы (например, «fulfilled» для digital_keys
+                # без назначенных ключей, миграция 0004). Откатываем ВСЮ попытку, включая изменения
+                # модуля, и учитываем её как неудачную — воркер не падает и не зацикливается.
+                conn.rollback()
+                if not _relock_unchanged(conn, task):
+                    conn.rollback()
+                    continue
+                status = _record_failure(conn, task, FulfillmentError("результат модуля отклонён проверкой базы"),
+                                         max_attempts, retry_delay_seconds)
+                conn.commit()
+                if status is not None:
+                    summary["failed" if status == "failed" else "retry"] += 1
+                continue
             conn.commit()
             summary[result.status] += 1
         finally:

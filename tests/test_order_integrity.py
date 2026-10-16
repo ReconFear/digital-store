@@ -372,6 +372,17 @@ PAYMENT_FUNCTIONS_0003 = (
     "payment_attempt_touch", "provider_event_accept", "payment_record_provider_state",
     "admin_resolve_payment", "admin_retry_paid_order", "request_refund",
 )
+# PR5 (миграция 0004)
+DIGITAL_KEYS_FUNCTIONS_0004 = (
+    "digital_key_stock_counts", "digital_keys_task_complete", "digital_keys_guard", "digital_keys_protect_truncate",
+    "digital_key_records_protect", "fulfillments_guard", "products_digital_stock_guard",
+    "digital_keys_assign", "order_delivery_view", "encryption_key_check_values", "shop_require_admin",
+    "shop_is_owner_role", "digital_keys_import_core", "digital_keys_withdraw_core", "fulfillment_resume_core",
+    "fulfillment_cancel_core", "digital_stock_reconcile_core", "encryption_key_register_core",
+    "digital_keys_keyring_sample_core", "admin_import_digital_keys", "admin_withdraw_digital_key",
+    "admin_resume_fulfillment", "admin_cancel_fulfillment", "admin_reconcile_digital_stock",
+    "admin_register_encryption_key", "admin_digital_keys_keyring_sample", "admin_whoami",
+)
 
 
 def _schema(conn):
@@ -481,7 +492,7 @@ def test_trigger_functions_have_trusted_search_path_in_test_schema(shop):
     configs = dict(_query(shop, "SELECT p.proname, array_to_string(p.proconfig, ';') FROM pg_proc p "
                                 "JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = %s", (schema,)))
     # PR 3: в схеме появились функции 0003; у ВСЕХ функций схемы путь должен быть доверенным.
-    assert set(configs) == set(TRIGGER_FUNCTIONS) | set(PAYMENT_FUNCTIONS_0003)
+    assert set(configs) == set(TRIGGER_FUNCTIONS) | set(PAYMENT_FUNCTIONS_0003) | set(DIGITAL_KEYS_FUNCTIONS_0004)
     assert set(configs.values()) == {f"search_path=pg_catalog, {schema}, pg_temp"}
 
 

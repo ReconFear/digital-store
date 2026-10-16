@@ -7,6 +7,12 @@ load_dotenv()
 
 
 PRODUCT_COLUMNS = "id, name, price, quantity, is_for_sale"
+# Покупателю показывается продаваемый остаток (PR5, представление product_sellable_stock): у товаров
+# с автоматической выдачей ключей он не больше числа свободных ключей за вычетом ожидающих выдачи.
+# У остальных товаров он равен quantity.
+SELLABLE_QUANTITY = ("(SELECT s.sellable_quantity FROM product_sellable_stock s "
+                     "WHERE s.product_id = products.id)")
+PUBLIC_PRODUCT_COLUMNS = f"id, name, price, {SELLABLE_QUANTITY} AS quantity, is_for_sale"
 
 # Старый API (v1) отдаёт цену целыми рублями (price) и остаток (quantity).
 # Поэтому в v1 видны только товары, которые этот формат может описать честно:
@@ -56,10 +62,10 @@ def get_public_products_from_db(available_only=False):
 
     available_only=True дополнительно убирает товары с нулевым остатком.
     """
-    query = f"SELECT {PRODUCT_COLUMNS} FROM products WHERE is_for_sale = TRUE AND {V1_COMPATIBLE}"
+    query = f"SELECT {PUBLIC_PRODUCT_COLUMNS} FROM products WHERE is_for_sale = TRUE AND {V1_COMPATIBLE}"
 
     if available_only:
-        query += " AND quantity > 0"
+        query += f" AND {SELLABLE_QUANTITY} > 0"
 
     query += " ORDER BY id"
 
@@ -76,7 +82,7 @@ def get_public_product_from_db(product_id):
         with conn.cursor() as cursor:
             cursor.execute(
                 f"""
-                SELECT {PRODUCT_COLUMNS}
+                SELECT {PUBLIC_PRODUCT_COLUMNS}
                 FROM products
                 WHERE id = %s
                   AND is_for_sale = TRUE
@@ -101,7 +107,7 @@ def create_order_in_db(product_id):
         with conn.cursor() as cursor:
             cursor.execute(
                 f"""
-                SELECT id, price, quantity, is_for_sale, ({V1_COMPATIBLE})
+                SELECT id, price, {SELLABLE_QUANTITY}, is_for_sale, ({V1_COMPATIBLE})
                 FROM products
                 WHERE id = %s
                 """,

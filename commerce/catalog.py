@@ -7,7 +7,9 @@
 import database
 from commerce.money import CURRENCY_EXPONENTS, money_json
 
-_COLUMNS = "id, name, product_type, inventory_mode, price_minor, currency, quantity"
+# quantity — продаваемый остаток (PR5): у товаров с автоматической выдачей ключей не больше
+# числа свободных ключей за вычетом ожидающих выдачи (database.SELLABLE_QUANTITY).
+_COLUMNS = f"id, name, product_type, inventory_mode, price_minor, currency, {database.SELLABLE_QUANTITY}"
 
 
 def _product_v2(row):
@@ -31,7 +33,7 @@ def _public_filter():
 def get_public_products(available_only=False):
     query = f"SELECT {_COLUMNS} FROM products WHERE {_public_filter()}"
     if available_only:
-        query += " AND (inventory_mode = 'unlimited' OR quantity > 0)"
+        query += f" AND (inventory_mode = 'unlimited' OR {database.SELLABLE_QUANTITY} > 0)"
     query += " ORDER BY id"
 
     with database.get_connection() as conn:

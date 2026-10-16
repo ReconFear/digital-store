@@ -81,11 +81,19 @@ def shop_roles(make_schema):
     passwords = {kind: secrets.token_urlsafe(16) for kind in ("app", "worker", "admin_user")}
     admin_user = f"{prefix}_admin_user"
     _run(conn, db_roles.create_roles_sql(prefix))
-    for kind in ("app", "worker"):
-        _run(conn, f"ALTER ROLE {names[kind]} PASSWORD '{passwords[kind]}'")
-    _run(conn, f"CREATE ROLE {admin_user} LOGIN PASSWORD '{passwords['admin_user']}' IN ROLE {names['admin']}")
-    _run(conn, db_roles.grants_sql(schema, prefix))
-    _run(conn, "INSERT INTO products (name, price_minor, quantity, is_for_sale) VALUES ('A', 10000, 5, TRUE)")
+    created = list(names.values()) + [admin_user]
+    try:
+        for kind in ("app", "worker"):
+            _run(conn, f"ALTER ROLE {names[kind]} PASSWORD '{passwords[kind]}'")
+        _run(conn, f"CREATE ROLE {admin_user} LOGIN PASSWORD '{passwords['admin_user']}' IN ROLE {names['admin']}")
+        # CONNECT — только временным ролям, как database_sql (app, worker, группа admin); PUBLIC не трогаем.
+        # Нужен, если в тестовой базе выполнен REVOKE CONNECT ... FROM PUBLIC (DB_ROLES.md, шаг 4).
+        grant_connect(conn, [names["app"], names["worker"], names["admin"]])
+        _run(conn, db_roles.grants_sql(schema, prefix))
+        _run(conn, "INSERT INTO products (name, price_minor, quantity, is_for_sale) VALUES ('A', 10000, 5, TRUE)")
+    except BaseException:
+        _drop_roles(conn, schema, created)
+        raise
 
     roles = {
         "owner": conn, "schema": schema,
@@ -94,21 +102,54 @@ def shop_roles(make_schema):
         "admin": _Role(admin_user, passwords["admin_user"], schema),
     }
     try:
-        roles["app"].run("SELECT 1")
-    except Exception as exc:  # noqa: BLE001 — окружение не пускает новые роли (pg_hba, CONNECT)
-        _drop_roles(conn, schema, list(names.values()) + [admin_user])
-        pytest.skip(f"не удалось подключиться новой ролью: {type(exc).__name__}")
+        for kind in ("app", "worker", "admin"):
+            roles[kind].run("SELECT 1")
+    except Exception as exc:  # noqa: BLE001
+        # Согласие на создание ролей дано, роли созданы, а войти ими нельзя (pg_hba, пароли):
+        # это ошибка окружения, а не повод молча пропустить проверки безопасности.
+        _drop_roles(conn, schema, created)
+        pytest.fail(f"временная роль не может подключиться к тестовой базе: {type(exc).__name__}: {exc}. "
+                    "Проверьте pg_hba.conf (парольный вход на localhost).")
     yield roles
-    _drop_roles(conn, schema, list(names.values()) + [admin_user])
+    _drop_roles(conn, schema, created)
+
+
+def current_database(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT current_database()")
+        name = cur.fetchone()[0]
+    conn.commit()
+    return name
+
+
+def grant_connect(conn, roles):
+    """CONNECT на текущую тестовую базу — только перечисленным временным ролям (не PUBLIC).
+    Выдаёт владелец базы или суперпользователь; иначе — понятная ошибка, а не пропуск."""
+    database_name = current_database(conn)
+    try:
+        for role in roles:
+            _run(conn, f"GRANT CONNECT ON DATABASE {database_name} TO {role}")
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        pytest.fail(f"нельзя выдать CONNECT на {database_name} временным ролям: {type(exc).__name__}: {exc}. "
+                    "Запускайте тесты прав под владельцем тестовой базы или суперпользователем.")
 
 
 def _drop_roles(conn, schema, roles):
-    # Права ролей есть только на объекты временной схемы: удаляем схему, затем роли.
-    # (DROP OWNED BY требует членства в роли, которого у создателя в PG16+ по умолчанию нет.)
+    # Права ролей есть только на объекты временной схемы и CONNECT на базу: удаляем схему, отзываем
+    # CONNECT, затем удаляем роли. (DROP OWNED BY требует членства в роли, которого у создателя в
+    # PG16+ по умолчанию нет.)
     conn.rollback()
     _run(conn, f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    database_name = current_database(conn)
     for role in reversed(roles):
-        _run(conn, f"DROP ROLE IF EXISTS {role}")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+            exists = cur.fetchone() is not None
+        conn.commit()
+        if exists:
+            _run(conn, f"REVOKE CONNECT ON DATABASE {database_name} FROM {role}")
+            _run(conn, f"DROP ROLE {role}")
 
 
 @pytest.fixture
