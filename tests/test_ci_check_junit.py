@@ -1,7 +1,8 @@
 """PR6 Stage 2f-2: ci/check_junit.py — строгая проверка отчёта pytest в CI. Офлайн: без базы и без .env.
 
 Три части:
-  * искусственные отчёты JUnit — каждый вид нарушения отдельно и полностью успешный отчёт;
+  * искусственные отчёты JUnit — каждый вид нарушения отдельно и полностью успешный отчёт; профиль g9 — ровно
+    семь ожидаемых тестов отдельного прогона tests/test_account_disconnect_db.py;
   * настоящие отчёты pytest (отдельный процесс pytest на маленьком наборе во временной папке): формат, на котором
     основан подсчёт (пропуск модуля, ошибка сбора, классы, параметры, сбой teardown, xfail/XPASS);
   * .github/workflows/ci.yml: dotenv отключён, xfail_strict, check_junit.py с порогом не меньше 1600.
@@ -181,6 +182,72 @@ def test_min_tests_is_required(tmp_path):
     assert exit_info.value.code == 2
 
 
+# ---------- профиль g9: отдельный обязательный прогон tests/test_account_disconnect_db.py ----------
+
+G9 = sorted(check_junit.G9_TESTS)
+
+
+def _g9_cases(drop=None, outcome=None, extra=()):
+    cases = [_case(classname, name, outcome if (classname, name) == G9[0] else None)
+             for classname, name in G9 if (classname, name) != drop]
+    return cases + [_case(classname, name) for classname, name in extra]
+
+
+def _run_g9(path, capsys):
+    code = check_junit.main([str(path), "--min-tests", "7", "--profile", "g9"])
+    output = capsys.readouterr()
+    return code, output.out + output.err
+
+
+def test_g9_report_with_exactly_the_seven_expected_tests_passes(tmp_path, capsys):
+    code, output = _run_g9(_report(tmp_path, _g9_cases()), capsys)
+    assert code == 0, output
+    assert "Тестов 7 (записей <testcase> 7): passed 7" in output and "test_account_disconnect_db 7/7" in output
+
+
+def test_g9_missing_expected_test_fails(tmp_path, capsys):
+    code, output = _run_g9(_report(tmp_path, _g9_cases(drop=G9[-1])), capsys)
+    assert code == 1 and f"нет ожидаемого теста: {G9[-1][0]}::{G9[-1][1]}" in output
+
+
+@pytest.mark.parametrize("extra", [
+    ("tests.test_account_disconnect_db", "test_unexpected"),
+    ("tests.test_account_disconnect", "test_d1_disconnected_client_does_not_stop_the_handler"),
+])
+def test_g9_extra_test_fails(tmp_path, capsys, extra):
+    code, output = _run_g9(_report(tmp_path, _g9_cases(extra=[extra])), capsys)
+    assert code == 1 and f"лишний тест: {extra[0]}::{extra[1]}" in output
+
+
+@pytest.mark.parametrize("outcome", ["skip", "xfail", "failure", "error"])
+def test_g9_any_non_passed_outcome_fails(tmp_path, capsys, outcome):
+    code, output = _run_g9(_report(tmp_path, _g9_cases(outcome=outcome)), capsys)
+    assert code == 1 and "недопустимые исходы" in output
+
+
+def test_g9_module_skipped_entirely_fails(tmp_path, capsys):
+    code, output = _run_g9(_report(tmp_path, [_case("", "tests.test_account_disconnect_db", "collection_skip")]),
+                           capsys)
+    assert code == 1 and "нет ожидаемого теста" in output and "лишний тест: tests.test_account_disconnect_db" in output
+
+
+def test_g9_missing_report_is_exit_code_2(tmp_path, capsys):
+    code, output = _run_g9(tmp_path / "junit-g9.xml", capsys)
+    assert code == 2 and "Отчёт не прочитан" in output
+
+
+def test_g9_expected_names_are_node_ids_of_the_module():
+    """Каждое имя G9_TESTS — функция модуля и её значения параметров из исходника (статически, без pytest)."""
+    source = (PROJECT_DIR / "tests" / "test_account_disconnect_db.py").read_text(encoding="utf-8")
+    assert len(G9) == 7 and {classname for classname, _ in G9} == {"tests.test_account_disconnect_db"}
+    for _, name in G9:
+        function, _, params = name.partition("[")
+        assert f"\ndef {function}(" in source, name
+        for value in filter(None, params.rstrip("]").split("-")):
+            assert f'"{value}"' in source, (name, value)
+    assert len(re.findall(r"^def test_", source, flags=re.MULTILINE)) == 3
+
+
 # ---------- настоящие отчёты pytest ----------
 
 _PASSING = '''
@@ -304,9 +371,46 @@ def test_workflow_runs_pytest_strictly_and_checks_the_report():
     assert "if: ${{ !cancelled() }}" in step                          # отчёт проверяется и после падения тестов
 
 
+def _step(text, name):
+    start = text.index(f"- name: {name}")
+    end = text.find("\n      - name:", start + 1)
+    return text[start:] if end == -1 else text[start:end]
+
+
+def test_workflow_main_run_excludes_only_the_g9_module():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    main_run = re.search(r"run: python -m pytest (.*)", text).group(1).split()
+    assert [part for part in main_run if part.startswith(("--ignore", "--deselect"))] == [
+        "--ignore=tests/test_account_disconnect_db.py"]
+    assert "-k" not in main_run and "-m" not in main_run and "tests" in main_run
+
+
+def test_workflow_runs_g9_separately_and_mandatorily_after_the_invariants():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    configuration = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert "continue-on-error" not in configuration
+    names = ["Security invariants after tests", "Prepare G9 database", "Run G9 DB tests",
+             "Require G9 DB tests passed", "G9 database clean after tests"]
+    positions = [text.index(f"- name: {name}") for name in names]
+    assert positions == sorted(positions)
+    assert "id: invariants" in _step(text, names[0])
+    prepare = _step(text, names[1])
+    assert "id: g9_prepare" in prepare and "python ci/g9_db.py prepare" in prepare
+    assert "if: ${{ !cancelled() && steps.invariants.outcome == 'success' }}" in prepare
+    run = _step(text, names[2])
+    assert "if: ${{ !cancelled() && steps.g9_prepare.outcome == 'success' }}" in run
+    assert "tests/test_account_disconnect_db.py" in run and "-o xfail_strict=true" in run and "junit-g9.xml" in run
+    assert "DB_USER: ds_g9_ci_owner" in run and "TEST_DB_NAME: digital_store_g9_ci_test" in run
+    assert 'DS_TEST_CREATE_ROLES: "0"' in run and 'DB_PASSWORD="$G9_DB_PASSWORD"' in run
+    check = _step(text, names[3])
+    assert "if: ${{ !cancelled() }}" in check and "--profile g9" in check and "junit-g9.xml" in check
+    clean = _step(text, names[4])
+    assert "if: ${{ always() }}" in clean and "python ci/g9_db.py check" in clean
+
+
 def test_required_modules_exist_in_the_test_suite():
     for module in REQUIRED:
         assert (PROJECT_DIR / "tests" / f"{module}.py").is_file(), module
     assert {"test_customer_auth_privileges", "test_account_service_db", "test_account_http_db",
             "test_account_order_db", "test_account_maintenance_db", "test_customer_auth_invariants_db",
-            "test_db_privileges", "test_digital_keys_privileges"} == set(REQUIRED)
+            "test_db_privileges", "test_digital_keys_privileges", "test_account_disconnect"} == set(REQUIRED)

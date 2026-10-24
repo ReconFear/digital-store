@@ -149,7 +149,9 @@ jobs:
       - name: Run full test suite
         timeout-minutes: 20
         # xfail_strict: XPASS — failure (в JUnit без строгого режима XPASS неотличим от passed).
-        run: python -m pytest -q -ra -o xfail_strict=true tests --junitxml="$RUNNER_TEMP/junit.xml"
+        # test_account_disconnect_db.py — только в отдельном обязательном прогоне G9 ниже: его дочерний процесс
+        # принимает лишь свою одноразовую базу и роль (этой базе и роли postgres он откажет).
+        run: python -m pytest -q -ra -o xfail_strict=true tests --ignore=tests/test_account_disconnect_db.py --junitxml="$RUNNER_TEMP/junit.xml"
 
       - name: Require all tests passed, required modules ran (no skip / xfail)
         if: ${{ !cancelled() }}
@@ -158,6 +160,7 @@ jobs:
         run: python ci/check_junit.py "$RUNNER_TEMP/junit.xml" --min-tests 1600
 
       - name: Security invariants after tests
+        id: invariants
         if: ${{ always() }}
         timeout-minutes: 3
         run: >-
@@ -165,3 +168,43 @@ jobs:
           --database "$TEST_DB_NAME"
           --prefix "$CI_ROLE_PREFIX"
           --baseline "$RUNNER_TEMP/ci-db-baseline.json"
+
+      # G9 (PR6): семь тестов tests/test_account_disconnect_db.py — отдельный ОБЯЗАТЕЛЬНЫЙ прогон на отдельной
+      # одноразовой базе digital_store_g9_ci_test и роли ds_g9_ci_owner без SUPERUSER (ci/g9_db.py). Создаются
+      # только после успешной проверки инвариантов основной базы — её снимок их не видит. Если подготовка не
+      # выполнена или упала, отчёта junit-g9.xml нет и проверка отчёта ниже красная (код 2); снимка G9 нет —
+      # красная и проверка чистоты. continue-on-error не используется.
+      - name: Prepare G9 database (separate disposable database and role)
+        id: g9_prepare
+        if: ${{ !cancelled() && steps.invariants.outcome == 'success' }}
+        timeout-minutes: 3
+        run: >-
+          python ci/g9_db.py prepare
+          --main-baseline "$RUNNER_TEMP/ci-db-baseline.json"
+          --baseline "$RUNNER_TEMP/g9-baseline.json"
+
+      - name: Run G9 DB tests (mandatory separate run)
+        if: ${{ !cancelled() && steps.g9_prepare.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          DB_HOST: 127.0.0.1
+          DB_USER: ds_g9_ci_owner
+          DB_NAME: digital_store_g9_ci_test
+          TEST_DB_NAME: digital_store_g9_ci_test
+          DS_TEST_CREATE_ROLES: "0"
+          DS_TEST_SUPERUSER: ""
+          DS_TEST_SUPERUSER_PASSWORD: ""
+        # Пароль роли — G9_DB_PASSWORD из $GITHUB_ENV (prepare, замаскирован); в настройках шага не печатается.
+        run: >-
+          DB_PASSWORD="$G9_DB_PASSWORD"
+          python -m pytest -q -ra -o xfail_strict=true -p no:cacheprovider tests/test_account_disconnect_db.py
+          --junitxml="$RUNNER_TEMP/junit-g9.xml"
+
+      - name: Require G9 DB tests passed (exactly the 7 expected tests)
+        if: ${{ !cancelled() }}
+        run: python ci/check_junit.py "$RUNNER_TEMP/junit-g9.xml" --min-tests 7 --profile g9
+
+      - name: G9 database clean after tests
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: python ci/g9_db.py check --baseline "$RUNNER_TEMP/g9-baseline.json"

@@ -1,6 +1,7 @@
 """Строгая проверка отчёта pytest (JUnit XML) в CI: только passed, обязательные модули выполнены, тестов достаточно.
 
     python ci/check_junit.py <junit.xml> --min-tests N
+    python ci/check_junit.py <junit-g9.xml> --min-tests 7 --profile g9
 
 Код выхода: 0 — всё в порядке; 1 — нарушение политики; 2 — отчёт не прочитан (нет файла, пустой или
 испорченный XML, не формат pytest).
@@ -27,6 +28,10 @@ passed, поэтому CI запускает pytest с -o xfail_strict=true (XPA
 Минимумы test_account_maintenance_db и test_customer_auth_invariants_db (Stage 2f-5b, 2f-7) подсчитаны по
 исходному коду модулей (функции test_* с учётом @pytest.mark.parametrize), без pytest --collect-only; сверить с
 первым полным прогоном CI.
+
+Профиль g9 (PR6 G9) — отдельный обязательный прогон tests/test_account_disconnect_db.py на одноразовой базе CI
+(ci/g9_db.py): в отчёте ровно семь ожидаемых тестов (G9_TESTS: classname и name), каждый passed; другой,
+недостающий или лишний тест — нарушение. Отсутствие отчёта — код 2. Остальные правила те же.
 """
 
 import argparse
@@ -43,7 +48,20 @@ REQUIRED_MODULES = {
     "test_account_order_db": 27,             # привязка заказа к аккаунту на настоящей базе
     "test_account_maintenance_db": 13,       # очистка auth_maintenance_purge (accounts.maintenance) на настоящей базе
     "test_customer_auth_invariants_db": 6,   # инварианты 0005 на настоящей базе: эпоха, окно счётчика, блокировки
+    "test_account_disconnect": 4,            # Г9 без базы: D1, D3, D4 ×2 (настоящий HTTP-стек, свои дочерние процессы)
 }
+# Профиль g9: точный состав отдельного прогона (pytest tests/test_account_disconnect_db.py из корня проекта).
+_G9_CLASS = "tests.test_account_disconnect_db"
+G9_TESTS = frozenset((_G9_CLASS, name) for name in (
+    "test_c3_client_disconnect_before_commit_does_not_prevent_commit[c3a_correct_password-fin]",
+    "test_c3_client_disconnect_before_commit_does_not_prevent_commit[c3a_correct_password-rst]",
+    "test_c3_client_disconnect_before_commit_does_not_prevent_commit[c3b_wrong_password-fin]",
+    "test_c3_client_disconnect_before_commit_does_not_prevent_commit[c3b_wrong_password-rst]",
+    "test_c4_child_killed_before_commit_rolls_back_and_releases_locks",
+    "test_d4_graceful_shutdown_with_open_transaction_commits_and_exits[programmatic_should_exit]",
+    "test_d4_graceful_shutdown_with_open_transaction_commits_and_exits[os_signal]",
+))
+PROFILES = {"main": (REQUIRED_MODULES, None), "g9": ({"test_account_disconnect_db": len(G9_TESTS)}, G9_TESTS)}
 SUITE_COUNTS = ("tests", "failures", "errors", "skipped")
 _OUTCOME_TAGS = {"failure": "failed", "error": "error", "skipped": "skipped"}
 _SEVERITY = ("failed", "error", "xfail", "skipped", "passed")    # исход теста — самый тяжёлый из его записей
@@ -109,8 +127,9 @@ def module_of(classname, name):
     return parts[-1]
 
 
-def evaluate(path, *, min_tests, required=None):
-    """-> (код выхода, строки отчёта, нарушения). Код 2 — отчёт не прочитан."""
+def evaluate(path, *, min_tests, required=None, exact=None):
+    """-> (код выхода, строки отчёта, нарушения). Код 2 — отчёт не прочитан. exact — точный набор
+    (classname, name), который должен быть в отчёте: ни одного недостающего и ни одного лишнего."""
     required = REQUIRED_MODULES if required is None else required
     try:
         records, declared, found = read_report(path)
@@ -157,6 +176,10 @@ def evaluate(path, *, min_tests, required=None):
             state = "отсутствует в отчёте" if passed_by_module[module] == 0 and not any(
                 module_of(c, n) == module for c, n in tests) else f"выполнено {passed_by_module[module]}"
             problems.append(f"обязательный модуль {module}: {state}, требуется не меньше {minimum}")
+    if exact is not None:
+        missing, extra = sorted(set(exact) - set(tests)), sorted(set(tests) - set(exact))
+        problems.extend(f"нет ожидаемого теста: {classname}::{name}" for classname, name in missing)
+        problems.extend(f"лишний тест: {classname + '::' if classname else ''}{name}" for classname, name in extra)
     return (1 if problems else 0), lines, problems
 
 
@@ -172,8 +195,11 @@ def main(argv=None):
     parser.add_argument("junit")
     parser.add_argument("--min-tests", type=_positive, required=True,
                         help="минимум выполненных (passed) тестов по уникальным идентификаторам")
+    parser.add_argument("--profile", choices=sorted(PROFILES), default="main",
+                        help="main — полный прогон (REQUIRED_MODULES); g9 — ровно G9_TESTS")
     args = parser.parse_args(argv)
-    code, lines, problems = evaluate(args.junit, min_tests=args.min_tests)
+    required, exact = PROFILES[args.profile]
+    code, lines, problems = evaluate(args.junit, min_tests=args.min_tests, required=required, exact=exact)
     for line in lines:
         print(line)
     if problems:
