@@ -1,6 +1,7 @@
+import os
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from database import (
@@ -22,27 +23,30 @@ from commerce.schemas import (
     ProductV2,
 )
 from commerce.digital_keys.delivery import DeliveryError, get_delivery
-from http_security import (
-    RequestLimitsMiddleware,
-    SensitiveResponseHeadersMiddleware,
-    client_ip,
-    request_limits_options,
-)
+from accounts.config import load_account_settings
+from accounts.order_http import AccountOrders
+from accounts.service import AccountService
+from http_security import client_ip, request_limits_options
+from http_stack import install_http_stack
 from payments import PaymentServiceError, build_payment_service
 from payments.access import create_order_with_access
 
 app = FastAPI()
 
-# Ограничение частоты и размера запросов (http_security.py). Добавлено ДО CORS, поэтому
-# CORS остаётся внешним слоем и ответы 413/429 тоже получают CORS-заголовки.
+# Слои HTTP (http_stack.py): ограничение частоты и размера запросов (http_security.py) — внутри CORS,
+# поэтому ответы 413/429 тоже получают CORS-заголовки; запрет кэширования ответов выдачи ключей (PR5);
+# CORS — какие frontend-адреса браузер пустит к API (CORS_ALLOWED_ORIGINS, cors_settings.py; CORS — не защита API).
+# Аккаунты покупателей (PR6) по умолчанию выключены (DS_ACCOUNTS_ENABLED): тогда слои ровно как до PR6.
+# Включённые: маршруты /api/account/*, CORS с credentials только для ACCOUNT_TRUSTED_ORIGINS, no-store;
+# неверная настройка аккаунтов останавливает запуск.
 _limits = request_limits_options()
-app.add_middleware(RequestLimitsMiddleware, **_limits)
-# Ответы маршрута выдачи ключей (в том числе 404/429/503) — с запретом кэширования (PR5).
-app.add_middleware(SensitiveResponseHeadersMiddleware)
-
-# Какие frontend-адреса браузер пустит к API. Настраивается переменной
-# CORS_ALLOWED_ORIGINS (см. cors_settings.py). CORS — не защита API.
-app.add_middleware(CORSMiddleware, **cors_middleware_options())
+_account_settings = load_account_settings()
+accounts_web = install_http_stack(app, limits=_limits, cors_options=cors_middleware_options(),
+                                  account_settings=_account_settings, env=os.environ,
+                                  account_service=AccountService)
+# PR6: заказ v2 с cookie сессии привязывается к аккаунту (accounts/order_http.py). Без cookie и при выключенных
+# аккаунтах — прежний гостевой заказ; при выключенных cookie не читается.
+account_orders = AccountOrders(_account_settings, accounts_web.trusted_origins if accounts_web else None)
 
 # Платежи (PR 3). По умолчанию выключены: PAYMENTS_ENABLED=false (см. PAYMENTS.md).
 # Неверная конфигурация платежей останавливает запуск — без молчаливого отключения.
@@ -112,7 +116,8 @@ def get_orders():
 # API v2 — универсальное ядро (PR 2). Старые маршруты выше не менялись.
 # Деньги — целые минимальные единицы + валюта. Ошибки бизнес-правил:
 #   {"detail": {"code": "...", "message": "...", "product_ids": [...]}}
-# Ошибки формата запроса — стандартный 422 FastAPI ({"detail": [ ... ]}).
+# Ошибки формата запроса — стандартный 422 FastAPI ({"detail": [ ... ]}); заказ с cookie сессии аккаунта (PR6) —
+# 422 invalid_request без введённых значений (accounts/order_http.py).
 # Чтения заказа по id нет намеренно: без аутентификации это раскрыло бы чужие
 # заказы перебором id (см. COMMERCE_CORE.md).
 # ---------------------------------------------------------------------------
@@ -151,11 +156,21 @@ def get_product_v2(product_id: int):
     response_model=OrderCreatedV2,
     responses={404: {"model": ErrorV2}, 409: {"model": ErrorV2}, 422: {"model": ErrorV2}},
 )
-def create_order_v2_endpoint(request: CreateOrderIn):
+def create_order_v2_endpoint(request: CreateOrderIn, http_request: Request):
     # Заказ создаётся в статусе "pending". Оплата — отдельным запросом checkout.
     # access_token — секрет владельца заказа (PR 3): показывается один раз, в базе только хэш.
+    items = [(item.product_id, item.quantity) for item in request.items]
+
+    def create_linked(link):
+        # PR6, cookie сессии: заказ, секрет и привязка к аккаунту — одна транзакция; тело — как у гостя.
+        order, access_token = create_order_with_access(items, after_access=link)
+        return OrderCreatedV2(order=order, access_token=access_token).model_dump(mode="json")
+
+    linked = account_orders.respond(http_request, create_linked, business_errors=(OrderError,))
+    if linked is not None:
+        return linked                                 # JSONResponse: response_model его не меняет
     try:
-        order, access_token = create_order_with_access([(item.product_id, item.quantity) for item in request.items])
+        order, access_token = create_order_with_access(items)
     except OrderError as error:
         raise HTTPException(status_code=error.http_status, detail=error.as_detail())
 

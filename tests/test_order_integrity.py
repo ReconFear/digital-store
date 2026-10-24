@@ -16,6 +16,7 @@ import database
 import migrate
 import test_migrations
 from commerce.orders import create_order
+from test_migration_0005 import FUNCTIONS_0005 as ACCOUNT_FUNCTIONS_0005, LOCK_TIMEOUT_0005
 from test_migrations import _query, _quiet, _run
 
 make_schema = test_migrations.make_schema
@@ -383,6 +384,8 @@ DIGITAL_KEYS_FUNCTIONS_0004 = (
     "admin_resume_fulfillment", "admin_cancel_fulfillment", "admin_reconcile_digital_stock",
     "admin_register_encryption_key", "admin_digital_keys_keyring_sample", "admin_whoami",
 )
+# PR6 (миграция 0005): ACCOUNT_FUNCTIONS_0005 и LOCK_TIMEOUT_0005 — из test_migration_0005.py (там они
+# сверяются с текстом миграции).
 
 
 def _schema(conn):
@@ -489,11 +492,18 @@ def test_temp_table_shadowing_is_refused_after_migration(shop, scenario):
 
 def test_trigger_functions_have_trusted_search_path_in_test_schema(shop):
     schema = _schema(shop)
-    configs = dict(_query(shop, "SELECT p.proname, array_to_string(p.proconfig, ';') FROM pg_proc p "
+    configs = dict(_query(shop, "SELECT p.proname, coalesce(p.proconfig, '{}'::text[]) FROM pg_proc p "
                                 "JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = %s", (schema,)))
-    # PR 3: в схеме появились функции 0003; у ВСЕХ функций схемы путь должен быть доверенным.
-    assert set(configs) == set(TRIGGER_FUNCTIONS) | set(PAYMENT_FUNCTIONS_0003) | set(DIGITAL_KEYS_FUNCTIONS_0004)
-    assert set(configs.values()) == {f"search_path=pg_catalog, {schema}, pg_temp"}
+    # PR 3, PR5, PR6: в схеме функции 0002–0005; у ВСЕХ функций схемы путь должен быть доверенным.
+    assert set(configs) == (set(TRIGGER_FUNCTIONS) | set(PAYMENT_FUNCTIONS_0003) | set(DIGITAL_KEYS_FUNCTIONS_0004)
+                            | ACCOUNT_FUNCTIONS_0005)
+    trusted = f"search_path=pg_catalog, {schema}, pg_temp"
+    for name, config in configs.items():
+        # Ровно один search_path доверенного вида; других параметров нет, кроме lock_timeout = 2s у функций
+        # 0005 с этапом блокировок (ADDENDUM2 §1.2).
+        assert [c for c in config if c.startswith("search_path=")] == [trusted], (name, config)
+        others = sorted(c for c in config if not c.startswith("search_path="))
+        assert others == (["lock_timeout=2s"] if name in LOCK_TIMEOUT_0005 else []), (name, config)
 
 
 def test_trigger_functions_have_trusted_search_path_in_public(db_value):

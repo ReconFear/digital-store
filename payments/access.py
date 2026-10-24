@@ -31,13 +31,19 @@ def token_sha256_hex(token):
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
-def create_order_with_access(items):
-    """Создаёт заказ v2 и секрет доступа к нему в одной транзакции. -> (order, token)."""
+def create_order_with_access(items, after_access=None):
+    """Создаёт заказ v2 и секрет доступа к нему в одной транзакции. -> (order, token).
+
+    after_access(cursor, order_id) — необязательный шаг в той же транзакции ПОСЛЕ выдачи секрета и до COMMIT
+    (PR6: привязка заказа к аккаунту, accounts/order_link.py). Исключение в нём отменяет заказ вместе с секретом.
+    """
     token = generate_token()
 
     def store_token(cursor, order_id):
         # Функция БД выдаёт секрет только заказу, создаваемому в этой же транзакции.
         cursor.execute("SELECT order_access_issue(%s, decode(%s, 'hex'))", (order_id, token_sha256_hex(token)))
+        if after_access is not None:
+            after_access(cursor, order_id)
 
     order = create_order(items, on_created=store_token)
     return order, token

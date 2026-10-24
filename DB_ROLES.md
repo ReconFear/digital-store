@@ -10,8 +10,10 @@
 |---|---|---|---|---|
 | `digital_store_migrator` | да | `migrate.py` | владелец таблиц и функций магазина | — (используется только для миграций) |
 | `digital_store_app` | да | `uvicorn api:app` | читать каталог (`products`, продаваемый остаток `product_sellable_stock`) и заказы (`orders`, `order_items` — нужно для `RETURNING` и проверок 0002), создавать заказы; через функции **с секретом заказа** — выдать секрет, посмотреть статус, начать оплату, привязать/пометить СВОЮ попытку, получить шифротексты СВОИХ выданных ключей (`order_delivery_view`, PR5); положить уведомление в очередь | читать `order_access` (хэши секретов), `payments`, `refunds`, `fulfillments`, `provider_events`, `money_operations`, `audit_log`, таблицы ключей PR5; `UPDATE` статусов, цен, остатков; `DELETE`/`TRUNCATE`; трогать попытки чужих заказов; вызывать `apply_paid_order`, `payment_record_provider_state`, `payment_attempt_bind/mark/touch`, админ-функции; создавать объекты |
-| `digital_store_worker` | да | `python -m payments.worker`, `python -m commerce.fulfillment_worker` | читать `payments`, `provider_events`, заказы, товары, задачи исполнения; учитывать проверенную оплату (`payment_record_provider_state`); привязывать/помечать попытки при сверке; обновлять аренду и статус событий и задачи исполнения (только перечисленные столбцы); назначать ключи задаче (`digital_keys_assign`, PR5) | читать `order_access`, `money_operations`, таблицы ключей; возобновлять/отменять задачи и ставить `fulfilled` без ключей (триггер 0004); прямой `UPDATE` заказов, товаров, платежей; `INSERT`/`DELETE` событий; `apply_paid_order` и функции веб-роли напрямую |
+| `digital_store_worker` | да | `python -m payments.worker`, `python -m commerce.fulfillment_worker`, `python -m accounts.maintenance` (PR6, отдельный процесс) | читать `payments`, `provider_events`, заказы, товары, задачи исполнения; учитывать проверенную оплату (`payment_record_provider_state`); привязывать/помечать попытки при сверке; обновлять аренду и статус событий и задачи исполнения (только перечисленные столбцы); назначать ключи задаче (`digital_keys_assign`, PR5) | читать `order_access`, `money_operations`, таблицы ключей; возобновлять/отменять задачи и ставить `fulfilled` без ключей (триггер 0004); прямой `UPDATE` заказов, товаров, платежей; `INSERT`/`DELETE` событий; `apply_paid_order` и функции веб-роли напрямую |
 | `digital_store_admin` | нет (группа) | люди — только через персональные учётные записи (`--part admin-login`) | читать всё, кроме хэшей секретов заказов и шифротекстов/отпечатков ключей; `admin_retry_paid_order`, `request_refund`, `admin_resolve_payment`; управление ключами PR5 (`admin_*`, `DIGITAL_KEYS.md`, раздел 5) | прямой `UPDATE`/`DELETE`; `apply_paid_order` напрямую |
+
+Аккаунты покупателей (PR6, миграция 0005): `app` вызывает только `auth_*`/`customer_*` (регистрация, вход, сессии, смена пароля, свои заказы, привязка нового заказа), `worker` — `auth_maintenance_purge` (только `EXECUTE` этой функции: удаляет счётчики попыток с истёкшим окном и давно недействительные сессии, без доступа к таблицам аккаунтов; вызывает отдельный процесс `python -m accounts.maintenance`, см. [ACCOUNTS.md](ACCOUNTS.md)), группа `admin` — `admin_customer_*` и `admin_auth_settings_update` (с проверкой `shop_require_admin`). Таблицы `customers`, `customer_sessions`, `customer_orders`, `auth_throttle`, `auth_settings` и схема `ext_pgcrypto` ни одной из этих ролей не доступны; точный перечень проверяет CI.
 
 Финансовые изменения — только через функции `SECURITY DEFINER` миграции 0003: владелец — мигратор (не суперпользователь), путь поиска закреплён (`pg_catalog, <схема>, pg_temp`), `EXECUTE` у `PUBLIC` отозван. Триггеры 0002/0003 дополнительно защищают историю даже от владельца (кроме `ALTER TABLE ... DISABLE TRIGGER` — это право владельца, поэтому мигратор не используется приложением).
 
@@ -73,6 +75,25 @@ notepad roles_1_create.sql          # прочитать
 
 `REVOKE CONNECT ... FROM PUBLIC`: другие роли (кроме владельца базы и суперпользователей) больше не подключатся. Если к этой базе ходит ещё кто-то — выдайте ему `CONNECT` явно.
 
+### Шаг 4а (PR6). pgcrypto в схеме `ext_pgcrypto`
+
+Нужен до миграции 0005 (аккаунты покупателей: bcrypt через `ext_pgcrypto.crypt`/`gen_salt`). Расширение ставится один раз на базу владельцем базы или суперпользователем — не миграцией: у мигратора нет права `CREATE` на базу.
+
+> **Внимание.** Выполнять установку расширения только с отдельного разрешения владельца, с заранее названными базой, ролью и ожидаемыми изменениями. Существующие базы (`digital_store`, `digital_store_test`, `digital_store_roles_test`, `digital_store_pr6_proto_test` и другие) этим шагом не трогать. Ниже — шаблон: `<новая_одноразовая_база>_test` заменить на имя НОВОЙ согласованной одноразовой базы.
+
+```powershell
+$db = "<новая_одноразовая_база>_test"   # шаблон: новая согласованная база, не существующая
+.\.venv\Scripts\python.exe deploy\db_roles.py --part extensions > roles_6_pgcrypto.sql
+notepad roles_6_pgcrypto.sql        # прочитать
+# только после отдельного разрешения владельца:
+& $psql -U postgres -d $db -v ON_ERROR_STOP=1 -f roles_6_pgcrypto.sql
+```
+
+- `USAGE` на `ext_pgcrypto` получает **только** мигратор: функции магазина `SECURITY DEFINER` выполняются с его правами. `app`, `worker` и группа `admin` прав на схему не получают, `PUBLIC` — тоже (`REVOKE ALL`).
+- Схемы `ext_pgcrypto` нет в `search_path` функций; вызовы — только с явной схемой.
+- `IF NOT EXISTS` не используется намеренно: если схема `ext_pgcrypto` уже есть (возможно, чужая) или `pgcrypto` установлен в другой схеме, скрипт остановится с ошибкой — разберитесь вручную, не удаляя чужие объекты.
+- `--prefix` — тот же, что в остальных шагах. В `--part all` этот шаг не входит.
+
 ### Шаг 5. Права
 
 ```powershell
@@ -93,6 +114,26 @@ PR5: вывод `--part grants` в конце содержит `INSERT INTO <с�
 ```
 
 `GRANT <prefix>_admin TO ivan_admin WITH INHERIT TRUE, SET FALSE` (PostgreSQL 16+): права группы действуют сразу, `SET ROLE` в группу запрещён. Мигратор и суперпользователь административные функции PR5 вызвать не могут — аварийный порядок в `DIGITAL_KEYS.md`, раздел 5.
+
+### Шаг 5б (PR6, необязательно). Параметры роли `app`
+
+Только по отдельному решению владельца. Меняет параметры **существующей** роли `<prefix>_app` (другие роли не трогает): `idle_in_transaction_session_timeout = '30s'` (открытая транзакция приложения не держит блокировки бесконечно), `log_parameter_max_length = 0` и `log_parameter_max_length_on_error = 0` (значения параметров запросов не попадают в журнал сервера).
+
+> **Внимание.** Изменять настройки ролей только с отдельного разрешения владельца, с заранее названными базой, ролью и ожидаемыми изменениями. Существующие базы (`digital_store`, `digital_store_test`, `digital_store_roles_test`, `digital_store_pr6_proto_test` и другие) этим шагом не трогать. Ниже — шаблон: `<новая_одноразовая_база>_test` заменить на имя НОВОЙ согласованной одноразовой базы.
+
+```powershell
+$db = "<новая_одноразовая_база>_test"   # шаблон: новая согласованная база, не существующая
+.\.venv\Scripts\python.exe deploy\db_roles.py --part app-settings --database $db > roles_7_app_settings.sql
+notepad roles_7_app_settings.sql
+# только после отдельного разрешения владельца:
+& $psql -U postgres -d $db -v ON_ERROR_STOP=1 -f roles_7_app_settings.sql
+```
+
+- `--database` обязателен: параметры действуют только в этой базе (`ALTER ROLE ... IN DATABASE ...`). Без него скрипт завершается ошибкой и SQL не печатает — параметры роли на весь кластер не генерируются.
+- `log_parameter_max_length*` — параметры уровня суперпользователя: выполнять под суперпользователем.
+- `statement_timeout` в выводе только комментарием: значение задаётся вручную после замера стоимости bcrypt (Г7) — больше `lock_timeout` + 2 × время bcrypt, с запасом.
+- Откат: `ALTER ROLE <prefix>_app IN DATABASE <база> RESET <параметр>;`.
+- В `--part all` этот шаг не входит.
 
 ### Шаг 6. Переключить процессы
 

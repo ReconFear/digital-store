@@ -5,8 +5,12 @@
 для браузера, а не защита от прямых HTTP-запросов.
 
 * Размер тела: Content-Length больше лимита -> 413 сразу; тело без Content-Length
-  (chunked) читается не дальше лимита -> 413. По умолчанию 16 КиБ, уведомления — 64 КиБ.
+  (chunked) читается не дальше лимита -> 413. По умолчанию 16 КиБ, уведомления — 64 КиБ;
+  отдельные пути могут получить свой лимит (path_body_limits, например 4 КиБ для аккаунтов PR6).
 * Частота: скользящее окно 60 секунд на (правило, IP клиента) -> 429 + Retry-After.
+  Правило с per_client=False считает все запросы ПРОЦЕССА одним счётчиком — это лимит процесса,
+  а не установки: при N процессах каждый считает сам (до N× limit). Такие правила проверяются после
+  правил по IP, чтобы запросы, уже отклонённые лимитом IP, не расходовали общий счётчик процесса.
 * IP клиента — адрес TCP-соединения. X-Forwarded-For учитывается, только если соединение
   пришло от доверенного прокси (TRUSTED_PROXY_IPS); иначе заголовок игнорируется,
   чтобы его нельзя было подделать.
@@ -34,6 +38,8 @@ class RateRule:
     path: re.Pattern
     limit: int
     window_seconds: int = 60
+    # True — счётчик на IP клиента; False — один счётчик на процесс (не на установку, см. описание модуля).
+    per_client: bool = True
 
 
 DEFAULT_RULES = (
@@ -52,6 +58,7 @@ WEBHOOK_MAX_BODY_BYTES = 64 * 1024
 WEBHOOK_PATH = re.compile(r"^/api/v2/payments/[^/]+/webhook/?$")
 BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _TOO_LARGE = {"detail": {"code": "payload_too_large", "message": "Слишком большой запрос."}}
+RATE_LIMITED_MESSAGE = "Слишком много запросов. Повторите позже."
 
 
 def rate_limits_enabled(env=None):
@@ -95,6 +102,25 @@ def _in_networks(ip, networks):
     return any(address in net for net in networks)
 
 
+def ordered_rules(rules):
+    """Правила по IP — раньше правил процесса (порядок внутри групп сохраняется): запрос, отклонённый
+    лимитом IP, не расходует общий счётчик процесса."""
+    return tuple(r for r in rules if r.per_client) + tuple(r for r in rules if not r.per_client)
+
+
+def rate_limit_retry(limiter, rules, method, path, ip):
+    """Через сколько секунд повторить, если запрос превысил правило; None — разрешён и учтён в каждом
+    подходящем правиле. rules — в порядке ordered_rules. Общая логика для RequestLimitsMiddleware и
+    маршрутов, которые применяют свои правила после собственных проверок (аккаунты PR6)."""
+    for rule in rules:
+        if method in rule.methods and rule.path.match(path):
+            key = (rule.name, ip) if rule.per_client else (rule.name,)
+            retry = limiter.hit(key, rule.limit, rule.window_seconds)
+            if retry is not None:
+                return retry
+    return None
+
+
 class SlidingWindowLimiter:
     def __init__(self, clock=time.monotonic, max_keys=20_000):
         self._clock = clock
@@ -131,12 +157,14 @@ async def _send_json(send, status, body, extra_headers=()):
 
 class RequestLimitsMiddleware:
     def __init__(self, app, *, rules=DEFAULT_RULES, max_body_bytes=DEFAULT_MAX_BODY_BYTES,
-                 webhook_max_body_bytes=WEBHOOK_MAX_BODY_BYTES, trusted_proxies=(), rate_limits=True,
-                 limiter=None):
+                 webhook_max_body_bytes=WEBHOOK_MAX_BODY_BYTES, path_body_limits=(), trusted_proxies=(),
+                 rate_limits=True, limiter=None):
         self.app = app
-        self.rules = rules
+        self.rules = ordered_rules(rules)
         self.max_body_bytes = max_body_bytes
         self.webhook_max_body_bytes = webhook_max_body_bytes
+        # ((шаблон пути, байт), ...) — первый совпавший; иначе лимит уведомлений или общий.
+        self.path_body_limits = tuple(path_body_limits)
         self.trusted_proxies = trusted_proxies
         self.rate_limits = rate_limits
         self.limiter = limiter or SlidingWindowLimiter()
@@ -149,21 +177,17 @@ class RequestLimitsMiddleware:
         path = scope.get("path", "/")
 
         if self.rate_limits:
-            ip = client_ip(scope, self.trusted_proxies)
-            for rule in self.rules:
-                if method in rule.methods and rule.path.match(path):
-                    retry = self.limiter.hit((rule.name, ip), rule.limit, rule.window_seconds)
-                    if retry is not None:
-                        await _send_json(send, 429, {"detail": {"code": "rate_limited",
-                                                                "message": "Слишком много запросов. Повторите позже."}},
-                                         [(b"retry-after", str(retry).encode())])
-                        return
+            retry = rate_limit_retry(self.limiter, self.rules, method, path, client_ip(scope, self.trusted_proxies))
+            if retry is not None:
+                await _send_json(send, 429, {"detail": {"code": "rate_limited", "message": RATE_LIMITED_MESSAGE}},
+                                 [(b"retry-after", str(retry).encode())])
+                return
 
         if method not in BODY_METHODS:
             await self.app(scope, receive, send)
             return
 
-        limit = self.webhook_max_body_bytes if WEBHOOK_PATH.match(path) else self.max_body_bytes
+        limit = self._body_limit(path)
         declared = None
         for name, value in scope.get("headers") or []:
             if name.lower() == b"content-length":
@@ -199,6 +223,12 @@ class RequestLimitsMiddleware:
             return await receive()
 
         await self.app(scope, replay, send)
+
+    def _body_limit(self, path):
+        for pattern, limit in self.path_body_limits:
+            if pattern.match(path):
+                return limit
+        return self.webhook_max_body_bytes if WEBHOOK_PATH.match(path) else self.max_body_bytes
 
 
 # Ответы с секретами покупателя (ключи товара) не должны оседать в кэшах браузера и прокси.

@@ -6,7 +6,9 @@
   1. роли магазина — deploy/db_roles.py create_roles_sql (мигратор БЕЗ SUPERUSER, app, worker, NOLOGIN-группа admin);
   2. база (владелец — суперпользователь контейнера, как у рабочей базы), мигратору — USAGE/CREATE на public;
   3. CONNECT — deploy/db_roles.py database_sql: REVOKE у PUBLIC, GRANT ролям магазина;
-  4. миграции 0000–0004 — migrate.py apply ПОД МИГРАТОРОМ (владелец таблиц и SECURITY DEFINER-функций — он);
+  3a. PR6: pgcrypto в схеме ext_pgcrypto — deploy/db_roles.py extensions_sql (владелец схемы — владелец базы,
+     USAGE только мигратору); до миграций: 0005 без него откажет;
+  4. миграции 0000–0005 — migrate.py apply ПОД МИГРАТОРОМ (владелец таблиц и SECURITY DEFINER-функций — он);
   5. права и shop_security_settings.admin_group — deploy/db_roles.py grants_sql;
   6. seed.sql — под мигратором;
   7. проверка модели безопасности и снимок для проверки после тестов.
@@ -86,6 +88,9 @@ def main(argv=None):
         _exec(conn, f"GRANT USAGE, CREATE ON SCHEMA public TO {names['migrator']}")
         # 3. CONNECT: REVOKE у PUBLIC, GRANT ролям магазина (штатный текст db_roles.py)
         _exec(conn, db_roles.database_sql(args.database, args.prefix))
+        # 3a. PR6: pgcrypto в ext_pgcrypto (штатный текст db_roles.py; DB_ROLES.md, шаг 4а). Выполняет владелец
+        # базы — суперпользователь одноразового контейнера; USAGE получает только мигратор.
+        _exec(conn, db_roles.extensions_sql(args.prefix))
     finally:
         conn.close()
 
@@ -126,7 +131,8 @@ def main(argv=None):
         raise InvariantError("модель безопасности после подготовки нарушена:\n  " + "\n  ".join(problems))
     Path(args.baseline).write_text(json.dumps(snap, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"База {args.database} готова: роли {sorted(names.values())}, миграции "
-          f"{[v for v, _ in snap['migrations']]}, admin_group {snap['admin_group']}, CONNECT у PUBLIC отозван.")
+          f"{[v for v, _ in snap['migrations']]}, admin_group {snap['admin_group']}, CONNECT у PUBLIC отозван, "
+          f"pgcrypto: {snap['extensions']}.")
     return 0
 
 

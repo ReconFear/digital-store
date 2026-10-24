@@ -19,6 +19,14 @@
 Изменение финансовых статусов и истории — только через SECURITY DEFINER-функции миграции
 0003 (путь поиска закреплён: pg_catalog, <схема>, pg_temp; EXECUTE у PUBLIC отозван).
 
+Аккаунты покупателей (PR6, миграция 0005): app вызывает только функции auth_*/customer_*, worker —
+auth_maintenance_purge, admin — admin_customer_* и admin_auth_settings_update. Таблицы аккаунтов
+(ACCOUNT_TABLES) и схема ext_pgcrypto ни одной из этих ролей не доступны.
+
+PR6: --part extensions — pgcrypto в схеме ext_pgcrypto (USAGE только мигратору); --part app-settings
+--database <база> — необязательные параметры роли app только в этой базе. Обе части печатаются только
+явно и в --part all не входят.
+
 Скрипт НЕ подключается к базе и НЕ меняет существующие роли. Существующие роли
 (например, postgres или прежняя роль приложения) он не трогает: переназначение
 владельца — отдельный шаг в DB_ROLES.md, выполняемый вручную.
@@ -46,6 +54,19 @@ APP_FUNCTIONS = (
     # PR5: выдача ключей покупателю и проверка версий ключей шифрования
     "order_delivery_view(integer, bytea)",
     "encryption_key_check_values()",
+    # PR6 (0005): аккаунты покупателей. Таблицы аккаунтов веб-роли недоступны — только эти функции;
+    # покупатель всегда выводится из хэша сессии внутри функции.
+    "auth_register(text, text, smallint, bytea)",
+    "auth_login(text, text, smallint, text, smallint, bytea, bytea)",
+    "auth_password_change(bytea, text, smallint, text, smallint, text, smallint, bytea)",
+    "auth_session_resolve(bytea)",
+    "auth_session_touch(bytea)",
+    "auth_session_revoke(bytea)",
+    "auth_sessions_revoke_all(bytea)",
+    "customer_profile_view(bytea)",
+    "customer_orders_view(bytea)",
+    "customer_order_view(bytea, integer)",
+    "customer_order_link_new(bytea, integer)",
 )
 # PR5: продаваемый остаток (каталог и создание заказа). Таблицы ключей веб-роли недоступны.
 APP_SELECT_VIEWS = ("product_sellable_stock",)
@@ -60,6 +81,8 @@ WORKER_FUNCTIONS = (
     # PR5: назначение ключей задаче (без секретов шифрования) и проверка триггера задач
     "digital_keys_assign(bigint)",
     "digital_keys_task_complete(bigint)",
+    # PR6: очистка истёкших счётчиков попыток и сессий
+    "auth_maintenance_purge()",
 )
 FULFILLMENT_COLUMNS = "status, attempts, last_error, status_note, next_attempt_at, updated_at, fulfilled_at"
 EVENT_COLUMNS = ("status, attempts, last_error, next_attempt_at, processed_at, "
@@ -81,6 +104,12 @@ ADMIN_FUNCTIONS = (
     "admin_digital_keys_keyring_sample()",
     "admin_whoami()",
     "encryption_key_check_values()",
+    # PR6 (каждая проверяет администратора через shop_require_admin; таблиц аккаунтов администратор не читает)
+    "admin_customer_lookup(text)",
+    "admin_customer_disable(bigint, text)",
+    "admin_customer_revoke_sessions(bigint, text)",
+    "admin_customer_release_email(bigint, text)",
+    "admin_auth_settings_update(boolean, boolean)",
 )
 ADMIN_SELECT_PR5 = ("digital_key_batches", "encryption_key_registry", "digital_key_stock", "fulfillment_issues",
                     "product_sellable_stock", "shop_security_settings")
@@ -91,7 +120,12 @@ ALL_TABLES = ("products", "orders", "order_items", "fulfillments", "payments", "
               "provider_events", "refunds", "audit_log", "order_access", "schema_migrations",
               # PR5
               "shop_security_settings", "encryption_key_registry", "digital_key_batches", "digital_keys",
-              "product_sellable_stock", "digital_key_stock", "fulfillment_issues")
+              "product_sellable_stock", "digital_key_stock", "fulfillment_issues",
+              # PR6
+              "auth_settings", "customers", "customer_sessions", "customer_orders", "auth_throttle")
+# PR6: таблицы аккаунтов (хэши паролей, сессии, принадлежность заказов, счётчики, настройки). Ни app, ни
+# worker, ни admin прав на них не получают (REV4 §5) — проверяет ci/db_invariants.py.
+ACCOUNT_TABLES = ("auth_settings", "customers", "customer_sessions", "customer_orders", "auth_throttle")
 
 
 def role_names(prefix):
@@ -99,7 +133,8 @@ def role_names(prefix):
 
 
 def _check(name, value):
-    if not IDENT.match(value):
+    # fullmatch, а не match: "$" в match пропускает завершающий перевод строки ("shop\n").
+    if not IDENT.fullmatch(value):
         raise ValueError(f"{name}: допустимы строчные латинские буквы, цифры и _ (получено {value!r})")
 
 
@@ -110,7 +145,7 @@ def grants_sql(schema="public", prefix="digital_store"):
     r = role_names(prefix)
     s = schema
     out = [
-        f"-- Права для схемы {s}. Выполнять после миграции 0004 под владельцем схемы или суперпользователем.",
+        f"-- Права для схемы {s}. Выполнять после миграции 0005 под владельцем схемы или суперпользователем.",
         f"REVOKE ALL ON ALL TABLES IN SCHEMA {s} FROM PUBLIC;",
         f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {s} FROM PUBLIC;",
         f"REVOKE CREATE ON SCHEMA {s} FROM PUBLIC;",
@@ -186,6 +221,17 @@ SHOP_FUNCTIONS = (
     "digital_keys_keyring_sample_core", "admin_import_digital_keys", "admin_withdraw_digital_key",
     "admin_resume_fulfillment", "admin_cancel_fulfillment", "admin_reconcile_digital_stock",
     "admin_register_encryption_key", "admin_digital_keys_keyring_sample", "admin_whoami",
+    # 0005 (аккаунты покупателей, PR6)
+    "auth_settings_dummy_hash", "customers_hash_cost_guard", "customer_sessions_guard", "customer_orders_protect",
+    "customer_orders_protect_truncate", "auth_require_read_committed", "auth_check_email",
+    "auth_check_not_reserved", "auth_check_proof", "auth_check_proof_pair", "auth_check_token",
+    "customer_session_customer", "auth_session_refusal", "customer_sessions_invalidate", "auth_register",
+    "auth_login", "auth_password_change", "auth_session_resolve", "auth_session_touch", "auth_session_revoke",
+    "auth_sessions_revoke_all", "customer_profile_view", "customer_orders_view", "customer_order_view",
+    "customer_order_link_new", "auth_maintenance_purge", "auth_check_reason", "customer_lookup_core",
+    "customer_disable_core", "customer_revoke_sessions_core", "customer_release_email_core",
+    "auth_settings_update_core", "admin_customer_lookup", "admin_customer_disable", "admin_customer_revoke_sessions",
+    "admin_customer_release_email", "admin_auth_settings_update",
 )
 
 
@@ -257,14 +303,69 @@ def database_sql(database, prefix="digital_store"):
     ]) + "\n"
 
 
+# PR6: схема расширения pgcrypto (bcrypt для паролей покупателей). Имя закреплено архитектурой P1:
+# функции 0005 вызывают ext_pgcrypto.crypt/gen_salt с явной схемой, в search_path её нет.
+PGCRYPTO_SCHEMA = "ext_pgcrypto"
+
+
+def extensions_sql(prefix="digital_store"):
+    """pgcrypto в отдельной схеме (PR6). Выполняет владелец базы или суперпользователь ДО миграции 0005.
+
+    USAGE на схему — только мигратору: SECURITY DEFINER-функции магазина выполняются с его правами.
+    app, worker и группа admin прав на схему не получают. IF NOT EXISTS не используется намеренно:
+    уже существующая схема (возможно, чужая) или расширение в другой схеме должны дать ошибку.
+    """
+    _check("prefix", prefix)
+    migrator = role_names(prefix)["migrator"]
+    s = PGCRYPTO_SCHEMA
+    return "\n".join([
+        f"-- PR6: pgcrypto в схеме {s}. Выполнять владельцем базы (или суперпользователем) в нужной базе",
+        "-- ДО миграции 0005. Без IF NOT EXISTS: существующая схема или расширение в другой схеме — ошибка,",
+        "-- разобраться вручную. USAGE — только мигратору; app, worker и admin прав на схему не получают.",
+        f"CREATE SCHEMA {s};",
+        f"CREATE EXTENSION pgcrypto WITH SCHEMA {s};",
+        f"REVOKE ALL ON SCHEMA {s} FROM PUBLIC;",
+        f"GRANT USAGE ON SCHEMA {s} TO {migrator};",
+    ]) + "\n"
+
+
+def app_settings_sql(database, prefix="digital_store"):
+    """Необязательные параметры роли app (PR6, REV4 Б4). Только по решению владельца, вручную.
+
+    Меняет параметры СУЩЕСТВУЮЩЕЙ роли <prefix>_app только в указанной базе (ALTER ROLE ... IN DATABASE);
+    база обязательна — параметры роли на весь кластер не генерируются. Другие роли не трогает.
+    log_parameter_max_length* — параметры уровня суперпользователя. statement_timeout — только
+    комментарием: значение зависит от замера стоимости bcrypt (Г7).
+    """
+    if not database:
+        raise ValueError("database: имя базы обязательно (ALTER ROLE ... IN DATABASE), без него SQL не генерируется")
+    _check("database", database)
+    _check("prefix", prefix)
+    app = role_names(prefix)["app"]
+    target = f"{app} IN DATABASE {database}"
+    return "\n".join([
+        f"-- Необязательно, только по решению владельца. Меняет параметры существующей роли {app} в базе {database}.",
+        "-- log_parameter_max_length* — параметры уровня суперпользователя: выполнять под суперпользователем.",
+        "-- Откат: ALTER ROLE ... RESET <параметр>;",
+        f"ALTER ROLE {target} SET idle_in_transaction_session_timeout = '30s';",
+        f"ALTER ROLE {target} SET log_parameter_max_length = 0;",
+        f"ALTER ROLE {target} SET log_parameter_max_length_on_error = 0;",
+        "-- statement_timeout задаётся вручную после замера Г7: больше lock_timeout + 2 x время bcrypt, с запасом.",
+        f"--   ALTER ROLE {target} SET statement_timeout = '<по замеру>';",
+    ]) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Печатает SQL ролей Digital Store. Ничего не применяет.")
     parser.add_argument("--schema", default="public")
     parser.add_argument("--prefix", default="digital_store")
-    parser.add_argument("--database", help="имя базы для REVOKE/GRANT CONNECT (необязательно)")
-    parser.add_argument("--part", choices=("all", "roles", "database", "ownership", "grants", "admin-login"),
+    parser.add_argument("--database", help="имя базы для REVOKE/GRANT CONNECT (необязательно); "
+                                           "для --part app-settings обязательно")
+    parser.add_argument("--part", choices=("all", "roles", "database", "ownership", "grants", "admin-login",
+                                           "extensions", "app-settings"),
                         default="all",
-                        help="all = roles + database (если указана) + grants; ownership и admin-login — только явно")
+                        help="all = roles + database (если указана) + grants; ownership, admin-login, "
+                             "extensions и app-settings — только явно")
     parser.add_argument("--login", help="для --part admin-login: имя персональной роли администратора")
     args = parser.parse_args(argv)
     parts = []
@@ -280,6 +381,12 @@ def main(argv=None):
         if not args.login:
             parser.error("--part admin-login требует --login")
         parts.append(admin_login_sql(args.login, args.prefix))
+    if args.part == "extensions":
+        parts.append(extensions_sql(args.prefix))
+    if args.part == "app-settings":
+        if not args.database:
+            parser.error("--part app-settings требует --database (параметры роли задаются только для одной базы)")
+        parts.append(app_settings_sql(args.database, args.prefix))
     sys.stdout.write("\n".join(parts))
     return 0
 

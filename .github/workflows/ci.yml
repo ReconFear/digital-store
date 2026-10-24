@@ -46,8 +46,14 @@ jobs:
           --health-retries 20
 
     env:
+      # python-dotenv не читает .env ни в одном шаге: database.py и cors_settings.py вызывают load_dotenv() при
+      # импорте, а все параметры CI заданы здесь явно. Без этого модули аккаунтов с настоящей базой
+      # (test_account_http_db.py, test_account_order_db.py, test_account_maintenance_db.py,
+      # test_customer_auth_invariants_db.py) пропускаются целиком — check_junit.py это отклонит.
+      PYTHON_DOTENV_DISABLED: "1"
       # Подключение тестов: суперпользователь ОДНОРАЗОВОГО контейнера (нужен тестам прав для создания
       # временных ролей и выдачи им CONNECT; так же проверялось на Windows). Никаких внешних баз.
+      # DS_TEST_CREATE_ROLES=1 — только здесь: роли создаются в кластере этого контейнера и удаляются тестами.
       DB_HOST: localhost
       DB_PORT: "5432"
       DB_USER: postgres
@@ -118,6 +124,20 @@ jobs:
           assert impl in ("binary", "c"), f"ожидалась бинарная реализация psycopg, получено {impl}"
           PY
 
+      - name: Verify python-dotenv is disabled (.env is never read)
+        run: |
+          python - <<'PY'
+          import os, pathlib, tempfile
+          import dotenv
+          # Контрольный файл во временной папке: при PYTHON_DOTENV_DISABLED python-dotenv его не читает.
+          with tempfile.TemporaryDirectory() as tmp:
+              canary = pathlib.Path(tmp, ".env")
+              canary.write_text("DS_DOTENV_CANARY=read\n", encoding="utf-8")
+              assert dotenv.load_dotenv(canary) is False and "DS_DOTENV_CANARY" not in os.environ, \
+                  "python-dotenv читает .env: проверьте PYTHON_DOTENV_DISABLED"
+          print("python-dotenv отключён: PYTHON_DOTENV_DISABLED =", os.environ["PYTHON_DOTENV_DISABLED"])
+          PY
+
       - name: Prepare PostgreSQL test database (DB_ROLES.md model)
         timeout-minutes: 5
         run: >-
@@ -128,11 +148,14 @@ jobs:
 
       - name: Run full test suite
         timeout-minutes: 20
-        run: python -m pytest -q -ra tests --junitxml="$RUNNER_TEMP/junit.xml"
+        # xfail_strict: XPASS — failure (в JUnit без строгого режима XPASS неотличим от passed).
+        run: python -m pytest -q -ra -o xfail_strict=true tests --junitxml="$RUNNER_TEMP/junit.xml"
 
-      - name: Require all tests passed (no skip / xfail)
+      - name: Require all tests passed, required modules ran (no skip / xfail)
         if: ${{ !cancelled() }}
-        run: python ci/check_junit.py "$RUNNER_TEMP/junit.xml" --min-tests 780
+        # 1641 тест при сборе на 2026-10-18; минимум 1600 — запас на осознанное удаление тестов. Обязательные
+        # модули и их минимумы — REQUIRED_MODULES в ci/check_junit.py.
+        run: python ci/check_junit.py "$RUNNER_TEMP/junit.xml" --min-tests 1600
 
       - name: Security invariants after tests
         if: ${{ always() }}

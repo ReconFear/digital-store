@@ -802,13 +802,46 @@ def test_payment_flow_logs_contain_no_secrets(service, yookassa, new_order, capl
     assert SECRET not in stored
 
 
+# Части имени столбца, означающие данные карт, секреты провайдера или пароли. Проверяется КАЖДАЯ часть имени
+# (card_number, provider_secret_key, user_password), а не только начало.
+FORBIDDEN_COLUMN_PARTS = {"card", "pan", "cvv", "cvv2", "cvc", "cvc2", "secret", "password", "passwd", "pwd"}
+# PR6 (миграция 0005): единственные разрешённые столбцы со словом password — в таблице покупателей, и только
+# при подтверждённом контексте (см. _assert_customer_password_columns_are_hash_only).
+ALLOWED_PASSWORD_COLUMNS = {("customers", "password_hash"), ("customers", "password_changed_at")}
+
+
 def test_database_stores_no_card_data_or_provider_secrets():
     columns = {
-        row[0]
-        for row in _rows("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public'")
+        (table, column)
+        for table, column in _rows("SELECT table_name, column_name FROM information_schema.columns "
+                                   "WHERE table_schema = 'public'")
     }
-    for forbidden in ("card", "pan", "cvv", "cvc", "secret", "password", "card_number"):
-        assert not any(forbidden == c or c.startswith(forbidden + "_") for c in columns), forbidden
+    offenders = sorted(f"{table}.{column}" for table, column in columns
+                       if FORBIDDEN_COLUMN_PARTS & set(column.split("_"))
+                       and (table, column) not in ALLOWED_PASSWORD_COLUMNS)
+    assert offenders == [], offenders
+    if columns & ALLOWED_PASSWORD_COLUMNS:
+        _assert_customer_password_columns_are_hash_only()
+
+
+def _assert_customer_password_columns_are_hash_only():
+    """Исключение для PR6 — только при контексте, исключающем открытый пароль: password_hash — NOT NULL text
+    с CHECK на формат bcrypt ($2a$, стоимость, 53 символа соли и хэша) и с триггером единой стоимости;
+    password_changed_at — только отметка времени. Открытый пароль в базу не передаётся вовсе: функции
+    принимают HMAC-доказательство, хэшируемое bcrypt (ext_pgcrypto.crypt)."""
+    types = dict(_rows("SELECT column_name, data_type || ':' || is_nullable FROM information_schema.columns "
+                       "WHERE table_schema = 'public' AND table_name = 'customers' "
+                       "AND column_name IN ('password_hash', 'password_changed_at')"))
+    assert types == {"password_hash": "text:NO", "password_changed_at": "timestamp with time zone:NO"}, types
+    checks = [definition for (definition,) in _rows(
+        "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c WHERE c.contype = 'c' "
+        "AND c.conrelid = 'public.customers'::regclass AND c.conname = 'customers_password_hash_check'")]
+    assert len(checks) == 1, checks
+    assert "password_hash ~" in checks[0] and "2a" in checks[0] and "{53}" in checks[0], checks[0]
+    triggers = [name for (name,) in _rows(
+        "SELECT tgname FROM pg_trigger WHERE tgrelid = 'public.customers'::regclass AND NOT tgisinternal "
+        "AND tgenabled <> 'D'")]
+    assert "customers_hash_cost_guard" in triggers, triggers
 
 
 def _rows(sql):

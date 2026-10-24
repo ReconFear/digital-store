@@ -1,6 +1,8 @@
 """Снимок и проверки модели безопасности тестовой базы CI (используют prepare_test_db.py и check_test_db.py).
 
-Только чтение. Секретов в снимке нет: имена ролей, атрибуты, ACL, владельцы, версии миграций.
+Только чтение. Секретов в снимке нет: имена ролей, атрибуты, ACL, владельцы, версии миграций, расширения.
+PR6: дополнительно проверяются pgcrypto в ext_pgcrypto, права ролей магазина на базу, схему и таблицы
+аккаунтов, точный перечень EXECUTE каждой роли, параметры функций и флаги аккаунтов (_pr6_problems).
 """
 
 import json
@@ -15,6 +17,11 @@ if str(ROOT) not in sys.path:
 import psycopg  # noqa: E402
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+# PR6 (0005, ADDENDUM2 §1.2): функции с этапом блокировок в подтранзакции — единственные, у которых кроме
+# search_path разрешён ещё один параметр, lock_timeout = 2s.
+LOCK_TIMEOUT_FUNCTIONS = {"auth_register", "auth_login", "auth_password_change", "auth_sessions_revoke_all",
+                          "customer_disable_core", "customer_revoke_sessions_core", "customer_release_email_core"}
 
 
 class InvariantError(Exception):
@@ -83,6 +90,15 @@ def snapshot(conn):
             WHERE NOT tgisinternal ORDER BY 1, 2"""),
         "admin_group": _rows(conn, "SELECT admin_group FROM shop_security_settings"),
         "migrations": _rows(conn, "SELECT version, checksum FROM schema_migrations ORDER BY version"),
+        # PR6: расширения и права на функции pgcrypto (тесты не должны их менять).
+        "extensions": _rows(conn, """
+            SELECT e.extname, n.nspname, pg_get_userbyid(e.extowner), e.extversion FROM pg_extension e
+            JOIN pg_namespace n ON n.oid = e.extnamespace ORDER BY 1"""),
+        "pgcrypto_functions": _rows(conn, """
+            SELECT p.oid::regprocedure::text, pg_get_userbyid(p.proowner),
+                   coalesce(p.proacl, acldefault('f', p.proowner))::text
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'ext_pgcrypto' ORDER BY 1"""),
     }
     snap["database_name"] = db
     return snap
@@ -130,12 +146,19 @@ def check_invariants(conn, prefix):
                       WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')""")
     if public_exec:
         problems.append(f"PUBLIC может выполнять SECURITY DEFINER-функции: {[r[0] for r in public_exec]}")
-    bad_path = _rows(conn, """
-        SELECT p.oid::regprocedure::text FROM pg_proc p
-        WHERE p.pronamespace = 'public'::regnamespace AND p.prosecdef
-          AND coalesce(array_to_string(p.proconfig, ';'), '') <> 'search_path=pg_catalog, public, pg_temp'""")
-    if bad_path:
-        problems.append(f"SECURITY DEFINER без доверенного search_path: {[r[0] for r in bad_path]}")
+    # Каждая функция схемы магазина (не только SECURITY DEFINER): ровно один search_path доверенного вида
+    # (REV5 §5.2 п.5). Других параметров нет, кроме lock_timeout = 2s у функций с этапом блокировок 0005
+    # (ADDENDUM2 §1.2): любой другой SET в определении функции — нарушение.
+    for signature, name, config in _rows(conn, """
+            SELECT p.oid::regprocedure::text, p.proname, coalesce(p.proconfig, '{}'::text[]) FROM pg_proc p
+            WHERE p.pronamespace = 'public'::regnamespace ORDER BY 1"""):
+        paths = [c for c in config if c.startswith("search_path=")]
+        others = sorted(c for c in config if not c.startswith("search_path="))
+        if paths != ["search_path=pg_catalog, public, pg_temp"]:
+            problems.append(f"функция без доверенного search_path (ровно один, pg_catalog, public, pg_temp): "
+                            f"{signature} {config}")
+        if others != (["lock_timeout=2s"] if name in LOCK_TIMEOUT_FUNCTIONS else []):
+            problems.append(f"неожиданные параметры функции {signature}: {others}")
     if one("""SELECT EXISTS (SELECT 1 FROM pg_database d, aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a
                             WHERE d.datname = current_database() AND a.grantee = 0
                               AND a.privilege_type = 'CONNECT')"""):
@@ -154,10 +177,113 @@ def check_invariants(conn, prefix):
 
     expected = [[m.version, m.checksum] for m in migrate.discover()]
     applied = _rows(conn, "SELECT version, checksum FROM schema_migrations ORDER BY version")
-    if [v for v, _ in expected][:5] != ["0000", "0001", "0002", "0003", "0004"]:
+    if [v for v, _ in expected][:6] != ["0000", "0001", "0002", "0003", "0004", "0005"]:
         problems.append(f"в репозитории неожиданный набор миграций: {[v for v, _ in expected]}")
     if applied != expected:
         problems.append(f"применённые миграции {applied} не совпадают с файлами {expected}")
+
+    problems += _pr6_problems(conn, prefix, one)
+    return problems
+
+
+def _pr6_problems(conn, prefix, one):
+    """PR6 (REV5 §5.2, ADDENDUM §2, ADDENDUM2 §2): pgcrypto, права ролей магазина, таблицы аккаунтов."""
+    from deploy import db_roles
+
+    problems = []
+    names = db_roles.role_names(prefix)
+    shop_roles = [names["app"], names["worker"], names["admin"]]
+
+    # pgcrypto установлен именно в ext_pgcrypto; схема принадлежит владельцу базы; в ней только объекты
+    # расширения; USAGE — только у мигратора, CREATE — ни у кого, кроме владельца схемы.
+    ext = _rows(conn, """
+        SELECT n.nspname, pg_get_userbyid(n.nspowner),
+               (SELECT pg_get_userbyid(d.datdba) FROM pg_database d WHERE d.datname = current_database())
+        FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pgcrypto'""")
+    if not ext or ext[0][0] != "ext_pgcrypto":
+        problems.append(f"pgcrypto должен быть установлен в схеме ext_pgcrypto (сейчас: {ext})")
+    else:
+        if ext[0][1] != ext[0][2]:
+            problems.append(f"владелец ext_pgcrypto ({ext[0][1]}) — не владелец базы ({ext[0][2]})")
+        acl = _rows(conn, """
+            SELECT coalesce(r.rolname, 'PUBLIC'), a.privilege_type
+            FROM pg_namespace n
+            CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a
+            LEFT JOIN pg_roles r ON r.oid = a.grantee
+            WHERE n.nspname = 'ext_pgcrypto' AND a.grantee <> n.nspowner ORDER BY 1, 2""")
+        if acl != [[names["migrator"], "USAGE"]]:
+            problems.append(f"права на ext_pgcrypto: ожидается только USAGE у {names['migrator']}, сейчас {acl}")
+        foreign = _rows(conn, """
+            SELECT p.oid::regprocedure::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'ext_pgcrypto' AND NOT EXISTS (
+                SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
+                WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                  AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e' AND e.extname = 'pgcrypto')
+            ORDER BY 1""")
+        if foreign:
+            problems.append(f"в ext_pgcrypto функции не из расширения pgcrypto: {[r[0] for r in foreign]}")
+        present = {r[0] for r in _rows(conn, """
+            SELECT DISTINCT p.proname::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'ext_pgcrypto' AND p.proname IN ('crypt', 'gen_salt', 'gen_random_bytes')""")}
+        if present != {"crypt", "gen_salt", "gen_random_bytes"}:
+            problems.append(f"в ext_pgcrypto нет нужных функций pgcrypto: {sorted(present)}")
+
+    # Ни одна роль магазина не создаёт объекты: ни CREATE на базу, ни CREATE на схему магазина; у ролей
+    # app/worker/admin нет TEMPORARY (временные объекты не появятся даже в pg_temp).
+    for role in names.values():
+        if one("SELECT has_database_privilege(%s, current_database(), 'CREATE')", (role,)):
+            problems.append(f"{role} имеет CREATE на базу")
+    for role in shop_roles:
+        if one("SELECT has_database_privilege(%s, current_database(), 'TEMPORARY')", (role,)):
+            problems.append(f"{role} имеет TEMPORARY на базу")
+        if one("SELECT has_schema_privilege(%s, 'public', 'CREATE')", (role,)):
+            problems.append(f"{role} может создавать объекты в схеме public")
+
+    # Таблицы аккаунтов недоступны app/worker/admin — ни на уровне таблицы, ни на уровне столбцов.
+    for table in db_roles.ACCOUNT_TABLES:
+        if one("SELECT to_regclass(%s) IS NULL", (f"public.{table}",)):
+            problems.append(f"нет таблицы {table} (миграция 0005)")
+            continue
+        for role in shop_roles:
+            if one("SELECT has_table_privilege(%s, %s, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') "
+                   "OR has_any_column_privilege(%s, %s, 'SELECT, INSERT, UPDATE, REFERENCES')",
+                   (role, f"public.{table}", role, f"public.{table}")):
+                problems.append(f"{role} имеет права на таблицу аккаунтов {table}")
+
+    # Точный перечень вызываемых (нетриггерных) функций каждой роли = матрица deploy/db_roles.py (REV4 T-A1).
+    # Триггерные функции 0002–0004 сохраняют EXECUTE у PUBLIC, но напрямую не вызываются.
+    for kind, functions in (("app", db_roles.APP_FUNCTIONS), ("worker", db_roles.WORKER_FUNCTIONS),
+                            ("admin", db_roles.ADMIN_FUNCTIONS)):
+        actual = {r[0] for r in _rows(conn, """
+            SELECT p.proname::text FROM pg_proc p
+            WHERE p.pronamespace = 'public'::regnamespace AND p.prorettype <> 'trigger'::regtype
+              AND has_function_privilege(%s, p.oid, 'EXECUTE')""", (names[kind],))}
+        expected = {f.split("(", 1)[0] for f in functions}
+        if actual != expected:
+            problems.append(f"{names[kind]}: EXECUTE не совпадает с матрицей db_roles.py: лишние "
+                            f"{sorted(actual - expected)}, недостающие {sorted(expected - actual)}")
+
+    # У каждого столбца *_sha256 — CHECK (octet_length(...) = 32) (ADDENDUM §2).
+    unchecked = _rows(conn, """
+        SELECT c.relname || '.' || a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+        WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
+          AND a.attname LIKE '%%sha256'
+          AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'c'
+                          AND strpos(pg_get_constraintdef(k.oid), 'octet_length(' || a.attname || ') = 32') > 0)
+        ORDER BY 1""")
+    if unchecked:
+        problems.append(f"столбцы *_sha256 без проверки длины 32 байта: {[r[0] for r in unchecked]}")
+
+    # Аккаунты и регистрация выключены (ADDENDUM2 §2); стоимость хэшей едина (0005, правило стоимости).
+    if one("SELECT to_regclass('public.auth_settings') IS NOT NULL"):
+        flags = _rows(conn, "SELECT accounts_enabled, registration_open FROM auth_settings")
+        if flags != [[False, False]]:
+            problems.append(f"auth_settings: ожидалось accounts_enabled = registration_open = FALSE, сейчас {flags}")
+        mixed = _rows(conn, """
+            SELECT count(*) FROM customers c, auth_settings s
+            WHERE substring(c.password_hash FROM '^.2a.([0-9]{2}).')::INTEGER <> s.bcrypt_cost""")
+        if mixed != [[0]]:
+            problems.append(f"хэши покупателей другой стоимости, чем auth_settings.bcrypt_cost: {mixed}")
     return problems
 
 

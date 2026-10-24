@@ -1,7 +1,7 @@
 """Общие настройки тестов Digital Store и предохранитель базы данных.
 
-Предохранитель гарантирует, что тесты не могут подключиться к основной базе
-(digital_store) или к любой базе, имя которой не оканчивается на "_test".
+Предохранитель отклоняет подключения через psycopg.connect к основной базе (digital_store)
+и к любой базе, имя которой не оканчивается на "_test" (граница перехвата — в конце).
 
 Как это работает:
 1. При загрузке этого файла (pytest грузит conftest.py ДО импорта тестов)
@@ -25,8 +25,14 @@ PostgreSQL для тестов без права подключения к ос�
 раздел «Автоматические тесты»). Под суперпользователем postgres у тестов
 технически есть доступ ко всем базам.
 
-Имя тестовой базы можно сменить переменной окружения TEST_DB_NAME
-(например, для второй тестовой базы); она тоже обязана оканчиваться на "_test".
+Тестовая база задаётся только явно — переменной окружения TEST_DB_NAME; имя обязано
+оканчиваться на "_test". Умолчания нет: без TEST_DB_NAME (или с пустым значением) любое
+подключение через psycopg.connect отклоняется до обращения к сети, а DB_NAME получает
+заведомо несуществующее имя NO_TEST_DB. Офлайн-тесты работают как прежде.
+
+Граница перехвата: подменён только атрибут модуля psycopg.connect — им пользуются database.py
+и тесты. Прямые вызовы psycopg.Connection.connect / psycopg.AsyncConnection.connect, низкоуровневый
+psycopg.pq и дочерние процессы Python этим предохранителем НЕ контролируются.
 """
 
 import os
@@ -63,10 +69,20 @@ for _name in ("DIGITAL_KEYS_ENCRYPTION_KEYS", "DIGITAL_KEYS_ACTIVE_KEY", "DIGITA
               "DIGITAL_KEYS_SECRETS_FILE", "FULFILLMENT_MODULES", "ADMIN_DB_USER", "ADMIN_DB_PASSWORD",
               "ADMIN_DB_HOST", "ADMIN_DB_PORT", "ADMIN_DB_NAME"):
     os.environ[_name] = ""
+# PR6: аккаунты покупателей в тестах принудительно выключены, их параметры из .env и внешнего окружения
+# не попадают (load_dotenv() не перезаписывает заданные переменные, в том числе пустые). Тесты аккаунтов
+# передают настройки и окружение явно (accounts.config.AccountSettings, словари окружения).
+os.environ["DS_ACCOUNTS_ENABLED"] = "off"
+for _name in ("DS_ACCOUNT_SECRETS_FILE", "ACCOUNT_TRUSTED_ORIGINS", "ACCOUNT_PEPPER_CURRENT",
+              "ACCOUNT_PEPPER_PREVIOUS", "ACCOUNT_CSRF_KEY"):
+    os.environ[_name] = ""
 
-TEST_DB_NAME = os.environ.get("TEST_DB_NAME", "digital_store_test")
-_require_test_db(TEST_DB_NAME, "TEST_DB_NAME")
-os.environ["DB_NAME"] = TEST_DB_NAME
+# Без явного TEST_DB_NAME базы нет вообще (fail-closed): прежнее умолчание digital_store_test убрано.
+TEST_DB_NAME = os.environ.get("TEST_DB_NAME") or None
+NO_TEST_DB = "ds_no_test_db_selected"       # не *_test: отклоняется предохранителем в любом случае
+if TEST_DB_NAME is not None:
+    _require_test_db(TEST_DB_NAME, "TEST_DB_NAME")
+os.environ["DB_NAME"] = TEST_DB_NAME or NO_TEST_DB
 
 _original_connect = psycopg.connect
 
@@ -76,6 +92,11 @@ def _require_selected_test_db(dbname, where):
     digital_store_test при TEST_DB_NAME=digital_store_roles_test) тоже отклоняется: иначе тест,
     выставивший DB_NAME сам, незаметно проверял бы другую базу с другой схемой и данными."""
     _require_test_db(dbname, where)
+    if TEST_DB_NAME is None:
+        raise ProductionDatabaseAccessError(
+            f"Предохранитель тестов: подключение к базе {dbname!r} запрещено ({where}). "
+            "В этом прогоне разрешена только тестовая база TEST_DB_NAME, а она не задана: задайте её явно."
+        )
     if dbname != TEST_DB_NAME:
         raise ProductionDatabaseAccessError(
             f"Предохранитель тестов: подключение к базе {dbname!r} запрещено ({where}). "
@@ -174,6 +195,10 @@ def make_product():
                 # Платёжные данные PR 3 (тоже защищены; удаляются в той же транзакции уборки).
                 for table in ("refunds", "money_operations", "audit_log", "payments", "order_access"):
                     cursor.execute(f"DELETE FROM {table} WHERE order_id = ANY(%s)", (order_ids,))
+                # PR6: привязки заказов к покупателям (ссылаются на заказы) — если миграция 0005 применена.
+                cursor.execute("SELECT to_regclass('customer_orders') IS NOT NULL")
+                if cursor.fetchone()[0]:
+                    cursor.execute("DELETE FROM customer_orders WHERE order_id = ANY(%s)", (order_ids,))
             # PR5: ключи (ссылаются на задачи, позиции и партии) и партии — до задач и товаров.
             cursor.execute("DELETE FROM digital_keys WHERE product_id = ANY(%s)", (created,))
             cursor.execute("DELETE FROM digital_key_batches WHERE product_id = ANY(%s)", (created,))

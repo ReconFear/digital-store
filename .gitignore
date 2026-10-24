@@ -7,3 +7,29 @@ __pycache__/
 .ruff_cache/
 *.dump
 *.backup
+
+# Секреты и ключи: настоящие значения никогда не попадают в Git
+# (например, файл ключей шифрования из DIGITAL_KEYS.md: digital-keys.env).
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Локальные архивы, патчи и выгрузки рабочих копий
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.patch
+*.diff
+
+# Отчёты инструментов, IDE и ОС
+.coverage
+htmlcov/
+junit*.xml
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

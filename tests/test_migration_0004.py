@@ -4,6 +4,7 @@
 Каждый тест — во временной схеме тестовой базы (make_schema)."""
 
 import hashlib
+import re
 
 import pytest
 
@@ -78,21 +79,24 @@ def test_old_migration_checksums_are_unchanged():
     assert found == OLD_CHECKSUMS
 
 
-def test_0004_is_last_and_checksummed():
+def test_0004_is_fifth_and_checksummed():
+    # PR6: после 0004 идёт 0005 (проверка «последняя миграция» — в test_migration_0005.py).
     versions = [m.version for m in migrate.discover()]
-    assert versions == ["0000", "0001", "0002", "0003", "0004"]
-    m = migrate.discover()[-1]
+    assert versions[:5] == ["0000", "0001", "0002", "0003", "0004"]
+    m = migrate.discover()[4]
     assert m.path.name == "0004_digital_key_fulfillment.sql"
     assert m.checksum == hashlib.sha256(migrate._normalize(m.path.read_bytes()).encode("utf-8")).hexdigest()
 
 
-def test_upgrade_from_0003_applies_only_0004_and_keeps_data(at_0003):
+def test_upgrade_from_0003_applies_only_0004_and_keeps_data(at_0003, tmp_path):
     conn, _, order_id = at_0003
     assert _query(conn, f"SELECT status FROM orders WHERE id = {order_id}") == [("paid",)]
     before = {name: _query(conn, sql) for name, sql in SNAPSHOT_SQL.items()}
     journal_before = _query(conn, "SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version")
 
-    applied = migrate.apply_migrations(conn, log=_quiet)
+    # PR6: переход 0003 -> 0004 — на наборе миграций до 0004 (0004 -> 0005 — в test_migration_0005.py).
+    until_0004 = _dir_until(tmp_path, "0004")
+    applied = migrate.apply_migrations(conn, until_0004, log=_quiet)
 
     assert [m.version for m in applied] == ["0004"]
     assert {name: _query(conn, sql) for name, sql in SNAPSHOT_SQL.items()} == before
@@ -103,14 +107,14 @@ def test_upgrade_from_0003_applies_only_0004_and_keeps_data(at_0003):
     for table in ("digital_keys", "digital_key_batches", "encryption_key_registry", "shop_security_settings"):
         assert _query(conn, f"SELECT count(*) FROM {table}") == [(0,)]
     # Повторный запуск ничего не делает.
-    assert migrate.apply_migrations(conn, log=_quiet) == []
+    assert migrate.apply_migrations(conn, until_0004, log=_quiet) == []
 
 
-def test_after_upgrade_legacy_data_is_safe(at_0003):
+def test_after_upgrade_legacy_data_is_safe(at_0003, tmp_path):
     """После 0004: старый товар с Q без ключей не продаётся (S = 0), его оплаченная до PR5 задача
     видна как ожидающая (W), выдача остановлена запросом возврата, Q не меняется миграцией."""
     conn, _, order_id = at_0003
-    migrate.apply_migrations(conn, log=_quiet)
+    migrate.apply_migrations(conn, _dir_until(tmp_path, "0004"), log=_quiet)
     assert _query(conn, "SELECT quantity FROM products WHERE id = 3") == [(6,)]
     assert _query(conn, "SELECT sellable_quantity FROM product_sellable_stock WHERE product_id = 3") == [(0,)]
     assert _query(conn, "SELECT quantity, available, awaiting, surplus FROM digital_key_stock WHERE product_id = 3") \
@@ -126,9 +130,10 @@ def test_after_upgrade_legacy_data_is_safe(at_0003):
     assert _query(conn, "SELECT digital_stock_reconcile_core(3, 'pytest')->>'new_quantity'") == [("0",)]
 
 
-def test_security_definer_search_path_and_public_execute(at_0003):
+def test_security_definer_search_path_and_public_execute(at_0003, tmp_path):
     conn, schema, _ = at_0003
-    migrate.apply_migrations(conn, log=_quiet)
+    # PR6: состав функций до 0004 включительно; функции 0005 — в test_migration_0005.py.
+    migrate.apply_migrations(conn, _dir_until(tmp_path, "0004"), log=_quiet)
     rows = _query(conn, """
         SELECT p.proname, p.prosecdef, coalesce(array_to_string(p.proacl, ','), ''),
                array_to_string(p.proconfig, ';')
@@ -166,17 +171,18 @@ def test_apply_paid_order_change_is_minimal():
 
 
 def test_schema_sql_contains_0004():
+    # PR6: после текста 0004 в schema.sql идёт 0005 — проверяется вхождение, а не окончание файла.
     text = (PROJECT_DIR / "schema.sql").read_text(encoding="utf-8-sig")
     assert "CREATE TABLE digital_keys" in text and "digital_keys_assign" in text
-    assert text.rstrip().endswith((PROJECT_DIR / "migrations" / "0004_digital_key_fulfillment.sql")
-                                  .read_text(encoding="utf-8-sig").rstrip())
+    assert (PROJECT_DIR / "migrations" / "0004_digital_key_fulfillment.sql").read_text(encoding="utf-8-sig").strip() \
+        in text
 
 
-def test_temp_table_shadowing_does_not_affect_delivery_view(at_0003):
+def test_temp_table_shadowing_does_not_affect_delivery_view(at_0003, tmp_path):
     """SECURITY DEFINER с закреплённым путём: временная таблица атакующего не подменяет order_access."""
     import database
     conn, schema, order_id = at_0003
-    migrate.apply_migrations(conn, log=_quiet)
+    migrate.apply_migrations(conn, _dir_until(tmp_path, "0004"), log=_quiet)
     fake = hashlib.sha256(b"fake").hexdigest()
     attacker = database.get_connection()
     try:
@@ -191,16 +197,37 @@ def test_temp_table_shadowing_does_not_affect_delivery_view(at_0003):
         attacker.close()
 
 
-def test_ownership_step_lists_every_shop_object(make_schema):
-    """deploy/db_roles.py --part ownership передаёт мигратору явный список объектов: в нём должны быть
-    все таблицы, представления и функции схемы после 0004 (иначе SECURITY DEFINER-функция осталась бы
-    у прежнего владельца, например у суперпользователя)."""
+def _declared_objects(versions):
+    """(таблицы и представления, функции), объявленные в тексте миграций с этими номерами."""
+    relations, functions = set(), set()
+    for path in sorted((PROJECT_DIR / "migrations").glob("*.sql")):
+        if path.name[:4] in versions:
+            text = path.read_text(encoding="utf-8-sig")
+            relations |= set(re.findall(r"^\s*CREATE (?:TABLE|VIEW)(?: IF NOT EXISTS)? ([a-z_]+)", text, re.MULTILINE))
+            functions |= set(re.findall(r"^CREATE (?:OR REPLACE )?FUNCTION ([a-z_]+)\(", text, re.MULTILINE))
+    return relations, functions
+
+
+def test_ownership_step_lists_every_shop_object(make_schema, tmp_path):
+    """deploy/db_roles.py --part ownership передаёт мигратору явный список объектов: схема после 0004 должна
+    содержать ровно объекты этого списка, кроме созданных более поздними миграциями (иначе SECURITY
+    DEFINER-функция осталась бы у прежнего владельца, например у суперпользователя). Объекты более поздних
+    миграций берутся из их текста; та же проверка для всех миграций —
+    test_migration_0005.py::test_ownership_step_lists_every_shop_object_after_0005."""
     from deploy import db_roles
+    versions = [m.version for m in migrate.discover()]
+    earlier = _declared_objects([v for v in versions if v <= "0004"])
+    later = _declared_objects([v for v in versions if v > "0004"])
+    # Объект, переопределённый позже (CREATE OR REPLACE), остаётся объектом 0000–0004.
+    later_relations, later_functions = later[0] - earlier[0], later[1] - earlier[1]
+    # Вычитается только то, что действительно есть в списках db_roles.py (иначе тест маскировал бы пропуск).
+    assert later_relations <= set(db_roles.ALL_TABLES) and later_functions <= set(db_roles.SHOP_FUNCTIONS)
+
     conn, schema = make_schema()
-    migrate.apply_migrations(conn, log=_quiet)
+    migrate.apply_migrations(conn, _dir_until(tmp_path, "0004"), log=_quiet)
     relations = {name for (name,) in _query(conn, "SELECT relname FROM pg_class WHERE relnamespace = %s::regnamespace "
                                                   "AND relkind IN ('r', 'p', 'v')", (schema,))}
     functions = {name for (name,) in _query(conn, "SELECT proname FROM pg_proc WHERE pronamespace = %s::regnamespace",
                                             (schema,))}
-    assert relations == set(db_roles.ALL_TABLES)
-    assert functions == set(db_roles.SHOP_FUNCTIONS)
+    assert relations == set(db_roles.ALL_TABLES) - later_relations
+    assert functions == set(db_roles.SHOP_FUNCTIONS) - later_functions
