@@ -43,6 +43,7 @@ import hashlib  # noqa: E402
 import itertools  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
+import secrets  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 
@@ -344,6 +345,60 @@ def test_valid_session_links_the_order_to_its_customer(shop, product):
     assert shop.get("/api/account/me", mine).status_code == 200                 # сессия не тронута
 
 
+def _without_order_identity(path, body):
+    """Ответ status/delivery без того, что у каждого заказа своё (номер заказа и позиции, время)."""
+    body = json.loads(json.dumps(body))
+    if path == "status":
+        body["order"].pop("id")
+        body["order"].pop("created_at")
+    elif path == "delivery":
+        body.pop("order_id")
+        for item in body["items"]:
+            item.pop("order_item_id")
+    return body
+
+
+def test_t_h9d_linked_order_access_token_works_for_checkout_status_and_delivery(shop, product):
+    """T-H9d (ADDENDUM §2): привязанный заказ — 201 и account_linked; его access_token действует для status
+    и delivery с cookie и без неё (неверный секрет — 404), ответы как у гостевого заказа в том же состоянии
+    (не оплачен: оплата и выдача ключей не имитируются). checkout при выключенных платежах отвечает 503 ещё
+    до проверки секрета: здесь подтверждается только ответ как у гостевого заказа, не доступ по access_token.
+    Cookie не заменяет access_token."""
+    session = shop.register(EMAIL)
+    linked = shop.order(product, session)
+    assert linked.status_code == 201 and linked.json()["account_linked"] is True
+    order_id, token = _created(linked)
+    assert _linked_to(shop, order_id) == _customer_id(shop.owner, EMAIL)
+    guest_id, guest_token = _created(shop.order(product, origin=None))
+    assert _linked_to(shop, guest_id) is None
+
+    def call(path, number, access_token, with_cookie=False):
+        extra = {"session": session, "csrf": None} if with_cookie else {"origin": None}
+        return shop.request("POST", f"/api/v2/orders/{number}/{path}", body={"access_token": access_token}, **extra)
+
+    for path, expected_status in (("checkout", 503), ("status", 200), ("delivery", 200)):
+        guest = call(path, guest_id, guest_token)
+        assert guest.status_code == expected_status, (path, guest.text)
+        for with_cookie in (False, True):
+            response = call(path, order_id, token, with_cookie)
+            assert response.status_code == expected_status, (path, with_cookie, response.text)
+            assert _without_order_identity(path, response.json()) == _without_order_identity(path, guest.json())
+            assert not response.headers.get_list("set-cookie")
+    status = call("status", order_id, token).json()
+    assert (status["order"]["id"], status["order"]["status"]) == (order_id, "pending")
+    delivery = call("delivery", order_id, token).json()
+    assert (delivery["order_id"], delivery["order_status"]) == (order_id, "pending")
+    assert [item["delivery_status"] for item in delivery["items"]] == ["awaiting_payment"]
+    assert all("digital_keys" not in item for item in delivery["items"])
+    # Действительная cookie без верного секрета заказа ничего не открывает: 404, как у неверного секрета.
+    wrong = secrets.token_urlsafe(32)
+    for path in ("status", "delivery"):
+        assert call(path, order_id, wrong, with_cookie=True).status_code == 404
+        assert call(path, order_id, wrong).status_code == 404
+    assert shop.query("SELECT status FROM orders WHERE id = %s", (order_id,)) == [("pending",)]
+    assert shop.get("/api/account/me", session).status_code == 200
+
+
 # ---------- 3–4. недействительная сессия: 401, cookie удаляется, всё откатывается ----------
 
 def _unknown(shop):
@@ -508,15 +563,23 @@ class _PausedLink:
             raise RuntimeError("сбой после привязки (тест)")
 
 
+# Ядра администратора (обёртки admin_* требуют ролей — tests/test_customer_auth_privileges.py): отключение берёт
+# строку покупателя FOR NO KEY UPDATE, освобождение email — FOR UPDATE (ADDENDUM2 §3.2).
+RIVAL_CORE_SQL = {
+    "disable": "SELECT customer_disable_core(%s, 'тест K9', 'pytest')",
+    "release_email": "SELECT customer_release_email_core(%s, 'тест K10a', 'pytest')",
+}
+
+
 def _start_rival(shop, rival, session, customer_id):
-    """«Выйти везде» (HTTP, AccountService) или отключение покупателя (SQL ядра администратора) в потоке."""
+    """«Выйти везде» (HTTP, AccountService), отключение покупателя или освобождение email (SQL ядра
+    администратора) в потоке."""
     if rival == "logout_all":
         count = len(shop.lab.opened)
         step = _Background(lambda: shop.session_post("/api/account/logout-all", session))
         return step, _wait_new_connection(shop.lab, count)
     peer, pid = shop.lab.peer()
-    return _Background(lambda: _call(peer, "SELECT customer_disable_core(%s, 'тест K9', 'pytest')",
-                                     (customer_id,))), pid
+    return _Background(lambda: _call(peer, RIVAL_CORE_SQL[rival], (customer_id,))), pid
 
 
 def _rival_succeeded(rival, step):
@@ -527,10 +590,11 @@ def _rival_succeeded(rival, step):
 
 
 @pytest.mark.parametrize("finish", ["commit", "rollback"])
-@pytest.mark.parametrize("rival", ["logout_all", "disable"])
+@pytest.mark.parametrize("rival", ["logout_all", "disable", "release_email"])
 def test_order_holding_the_customer_lock_finishes_before_the_rival(shop, product, monkeypatch, rival, finish):
-    """Заказ привязан и держит FOR SHARE; «выйти везде» или отключение ждёт (FOR NO KEY UPDATE). COMMIT заказа —
-    привязка остаётся (зафиксирована до отзыва), затем сессия отозвана; ROLLBACK — ни заказа, ни привязки."""
+    """Заказ привязан и держит FOR SHARE; «выйти везде», отключение (FOR NO KEY UPDATE) или освобождение email
+    (FOR UPDATE, K10b) ждёт. COMMIT заказа — привязка остаётся (зафиксирована до отзыва), затем сессия
+    отозвана; ROLLBACK — ни заказа, ни привязки."""
     session = shop.register(EMAIL)
     customer_id = _customer_id(shop.owner, EMAIL)
     before = shop.counts()
@@ -557,18 +621,18 @@ def test_order_holding_the_customer_lock_finishes_before_the_rival(shop, product
 
 
 @pytest.mark.parametrize("finish", ["commit", "rollback"])
-@pytest.mark.parametrize("rival", ["logout_all", "disable"])
+@pytest.mark.parametrize("rival", ["logout_all", "disable", "release_email"])
 def test_order_waiting_for_the_rival_sees_its_outcome(shop, product, rival, finish):
-    """Отзыв или отключение выполнено, но не зафиксировано; привязка ждёт FOR SHARE. COMMIT конкурента —
-    повторная проверка после ожидания отказывает: 401 и полный откат; ROLLBACK — заказ привязан."""
+    """Отзыв, отключение или освобождение email (K10a: HTTP-ответ покупателю) выполнено, но не зафиксировано;
+    привязка ждёт FOR SHARE. COMMIT конкурента — повторная проверка после ожидания отказывает: 401 и полный
+    откат; ROLLBACK — заказ привязан."""
     session = shop.register(EMAIL)
     customer_id = _customer_id(shop.owner, EMAIL)
     holder, _ = shop.lab.peer()
     if rival == "logout_all":
         assert _exec(holder, "SELECT auth_sessions_revoke_all(%s)", (session.sha256,)) == {"result": "ok"}
     else:
-        assert _exec(holder, "SELECT customer_disable_core(%s, 'тест K9', 'pytest')", (customer_id,)) == \
-            {"result": "ok"}
+        assert _exec(holder, RIVAL_CORE_SQL[rival], (customer_id,)) == {"result": "ok"}
     before = shop.counts()
     count = len(shop.lab.opened)
     order = _Background(lambda: shop.order(product, session))

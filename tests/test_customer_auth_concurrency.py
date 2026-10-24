@@ -1,7 +1,8 @@
 """PR6: конкурентность аккаунтов на настоящем PostgreSQL (REV5 §2.3, ADDENDUM §1.3, ADDENDUM2 §1.3, §3.4).
 
 K1–K5, K7, K8, K9 (новая), K10a–d, K11; эксперимент Г2 на настоящих функциях: A6, A8, B2–B4, B6 и A7 как
-наблюдение. K6 и M13 — мутационные проверки, отдельный этап до merge.
+наблюдение; L5 (REV5 §8) и Г8/T-L3 (параметры не видны в pg_stat_activity). K6 и M13 — мутационные проверки,
+отдельный этап до merge.
 
 Схема каждого теста — как в tests/test_digital_keys_concurrency.py: соединение держит транзакцию открытой,
 другое в потоке выполняет конфликтующий шаг, ожидание подтверждается по pg_stat_activity / pg_blocking_pids,
@@ -13,7 +14,9 @@ tests/test_customer_auth_privileges.py). bcrypt cost 4 — только в эт�
 
 import hashlib
 import os
+import threading
 import time
+from collections import Counter
 
 import psycopg
 import pytest
@@ -119,6 +122,70 @@ def test_k5_parallel_wrong_logins_and_password_change_no_deadlock(accounts, peer
     assert _joined(change, 30) == {"result": "ok"}
     assert set(results) <= {"invalid", "throttled"}, results
     assert _query(conn, "SELECT attempts FROM auth_throttle WHERE scope = 1") == [(20,)]
+
+
+# ---------- L5 и Г8/T-L3: параллельные попытки входа, параметры в pg_stat_activity (REV5 §8, §9) ----------
+
+L5_ATTEMPTS = 50
+
+
+def test_l5_parallel_wrong_logins_count_every_attempt_and_bcrypt_at_most_the_limit(accounts, peers, record_property):
+    """L5: 50 параллельных неверных попыток по одному email. Инварианты — из auth_login (0005):
+    * upsert счётчика держит его строку до конца транзакции, поэтому попытки, получившие строку, проходят
+      по одной и k-я видит attempts = k (окно 15 мин за время теста не истекает);
+    * 'busy' — только при ожидании дольше lock_timeout; подтранзакция откатывает и инкремент, bcrypt не было;
+    * attempts > login_limit → 'throttled' до bcrypt; bcrypt выполняют только ответы 'invalid'.
+    Отсюда: attempts = invalid + throttled, invalid = min(attempts, limit) — bcrypt не больше лимита."""
+    conn, _ = accounts
+    _register(conn)
+    limit = _query(conn, "SELECT login_limit FROM auth_settings")[0][0]
+    workers = [peers()[0] for _ in range(L5_ATTEMPTS)]
+    start = threading.Barrier(L5_ATTEMPTS, timeout=30)
+
+    def attempt(login):
+        start.wait()                                   # все соединения открыты, попытки стартуют вместе
+        value = _exec(login, LOGIN, (EMAIL, _proof(), 1, None, None, _token(), None))
+        login.commit()
+        return value
+
+    steps = [_Background(lambda login=login: attempt(login)) for login in workers]
+    results = [_joined(step, 60) for step in steps]
+    kinds = Counter(result["result"] for result in results)
+    record_property("l5_outcomes", dict(kinds))
+    assert set(kinds) <= {"invalid", "throttled", "busy"}, kinds
+    counted = kinds["invalid"] + kinds["throttled"]
+    assert counted > limit, f"блокировка не наступила: {dict(kinds)}"
+    assert _query(conn, "SELECT attempts FROM auth_throttle WHERE scope = 1") == [(counted,)]
+    assert kinds["invalid"] == min(counted, limit) <= limit
+    assert all(r["retry_after_seconds"] >= 1 for r in results if r["result"] == "throttled")
+    assert _query(conn, "SELECT count(*) FROM audit_log WHERE action = 'auth.login_throttled'") == [(1,)]
+    assert _sessions(conn) == 1                         # только сессия регистрации
+
+
+def test_g8_waiting_login_shows_placeholders_not_parameters(accounts, peers):
+    """Г8/T-L3: текст ожидающего вызова auth_login в pg_stat_activity — с плейсхолдерами $n, без email,
+    доказательства пароля и токена сессии (psycopg 3 передаёт параметры отдельно от текста запроса).
+    Вход ждёт строку покупателя (как B2); удерживающая транзакция откатывается сразу после наблюдения."""
+    conn, _ = accounts
+    proof, _ = _register(conn)
+    holder, _ = peers()
+    login, login_pid = peers()
+    new_session = _token()
+    _exec(holder, "SELECT 1 FROM customers WHERE email_norm = %s FOR NO KEY UPDATE", (EMAIL,))
+    step = _in_thread(login, LOGIN, (EMAIL, proof, 1, None, None, new_session, None))
+    try:
+        _wait_blocked(conn, login_pid)
+        observed = _query(conn, "SELECT state, wait_event_type, query FROM pg_stat_activity WHERE pid = %s",
+                          (login_pid,))
+    finally:
+        holder.rollback()
+    assert _joined(step) == {"result": "ok"}
+    assert len(observed) == 1
+    state, wait_event_type, text = observed[0]
+    assert (state, wait_event_type) == ("active", "Lock")
+    assert "auth_login(" in text and "$1" in text and "$7" in text
+    for secret in (EMAIL, proof, new_session.hex(), new_session.hex().upper()):
+        assert secret not in text
 
 
 # ---------- K7, K8: пересчёт хэша под новую версию перца (ADDENDUM §1.3) ----------

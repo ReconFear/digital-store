@@ -301,6 +301,25 @@ def test_login_throttle_window_and_bounded_audit(accounts):
     assert _query(conn, "SELECT attempts FROM auth_throttle WHERE scope = 1 AND attempts > 0") == [(5,)]
 
 
+def test_l4_successful_login_resets_the_counter_within_the_window(accounts):
+    """L4 (REV5 §1.1, §8): успех в том же окне обнуляет счётчик, окно не сдвигается. Без сброса первая
+    неверная попытка после успеха была бы четвёртой в окне и получила бы 'throttled'."""
+    conn, _ = accounts
+    proof, _ = _register(conn)
+    _run(conn, "UPDATE auth_settings SET login_limit = 3")
+    for _ in range(2):
+        assert _login(conn, _proof())[0] == {"result": "invalid"}
+    window = _query(conn, "SELECT window_start FROM auth_throttle WHERE scope = 1")
+    assert _query(conn, "SELECT attempts FROM auth_throttle WHERE scope = 1") == [(2,)]
+    assert _login(conn, proof)[0] == {"result": "ok"}                 # третья попытка окна — в пределах лимита
+    assert _query(conn, "SELECT attempts FROM auth_throttle WHERE scope = 1") == [(0,)]
+    for _ in range(3):
+        assert _login(conn, _proof())[0] == {"result": "invalid"}
+    result = _login(conn, _proof())[0]
+    assert result["result"] == "throttled" and result["retry_after_seconds"] >= 1
+    assert _query(conn, "SELECT window_start, attempts FROM auth_throttle WHERE scope = 1") == [(window[0][0], 4)]
+
+
 def test_pepper_rotation_rehash_and_missing_version(accounts):
     conn, _ = accounts
     old_proof, _ = _register(conn, ver=1)
