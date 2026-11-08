@@ -1,0 +1,84 @@
+/* Дизайн-токены витрины. Значения по умолчанию — дизайн Digital Store (прототип index.html/styles.css).
+   Бренд переопределяет цвета, градиенты, свечение и шрифт в brand/theme.css. */
+
+:root {
+  /* Поверхности и текст */
+  --color-bg: #0b0d12;
+  --color-header-bg: rgba(15, 17, 23, 0.95);
+  --color-surface: #14171d;
+  --color-surface-2: #181b22;
+  --color-surface-3: #242832;
+  --color-border: #242832;
+  --color-border-header: #252833;
+  --color-border-input: #2c303a;
+  --color-border-control: #30343f;
+  --color-text: #ffffff;
+  --color-text-muted: #b8bac4;
+  --color-text-subtle: #8f93a1;
+  --color-placeholder-text: #8a8f9e;
+
+  /* Состояния */
+  --color-success: #55d98b;
+  --color-danger: #ff6d78;
+  /* T2: единственный новый цвет — предупреждения (в прототипе их не было); контраст на карточке 11,25. */
+  --color-warning: #ffc266;
+  --color-info: var(--color-accent-2);
+
+  /* Акценты (бренд может заменить) */
+  --color-accent: #7c5cff;
+  --color-accent-soft: #9d8cff;
+  --color-accent-2: #00dcff;
+  /* Акцент для фона с белым текстом (активный чип): контраст 4,98, WCAG AA. */
+  --color-accent-strong: #7052f5;
+  --color-on-accent: #ffffff;
+  --color-focus: #00dcff;
+
+  /* Градиенты и свечение (бренд может заменить) */
+  --bg-spot-1: rgba(124, 92, 255, 0.16);
+  --bg-spot-2: rgba(0, 220, 255, 0.10);
+  --gradient-hero: linear-gradient(135deg, rgba(124, 92, 255, 0.22), rgba(22, 25, 35, 0.95), rgba(0, 200, 255, 0.10));
+  --gradient-product-image: linear-gradient(135deg, #242837, #34304d);
+  --gradient-button: linear-gradient(135deg, #7c5cff, #5b8cff);
+  --border-hero: rgba(124, 92, 255, 0.25);
+  --glow-hero: 0 0 40px rgba(124, 92, 255, 0.08);
+  --glow-card: 0 0 18px rgba(124, 92, 255, 0.35), 0 0 45px rgba(124, 92, 255, 0.14);
+  --glow-button: 0 0 16px rgba(124, 92, 255, 0.6);
+
+  /* Шрифт */
+  --font-family: Arial, sans-serif;
+  --font-size-base: 16px;
+  --font-size-small: 13px;
+  --font-size-control: 15px;
+  /* Кнопки прототипа использовали размер браузера по умолчанию (13.333px) — сохраняем его. */
+  --font-size-button: 13.333px;
+  --font-size-logo: 22px;
+  --font-size-hero: 48px;
+  --font-size-hero-mobile: 34px;
+  --font-size-hero-text: 17px;
+  --font-size-section: 32px;
+  --font-size-card-title: 21px;
+  --font-size-price: 20px;
+
+  /* Размеры и отступы */
+  --container-width: 1200px;
+  --gutter: 24px;
+  --gap-grid: 22px;
+  --card-image-height: 260px;
+  --radius-control: 10px;
+  --radius-input: 12px;
+  --radius-card: 18px;
+  --radius-hero: 24px;
+  /* Минимальная высота нажимаемых элементов навигации на телефоне. */
+  --touch-target: 44px;
+
+  /* Toast (T2) */
+  --toast-width: 360px;
+  --shadow-toast: 0 10px 30px rgba(0, 0, 0, 0.45), 0 0 18px rgba(124, 92, 255, 0.12);
+  --z-toast: 50;
+
+  /* Движение */
+  --duration-fast: 0.2s;
+  --duration-card: 0.25s;
+  --lift-card: -6px;
+  --scale-button: 1.04;
+}

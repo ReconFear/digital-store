@@ -1,0 +1,10 @@
+/* ТОЛЬКО ДЛЯ РАЗРАБОТКИ: отступы страницы образцов. Стили магазина здесь не меняются. */
+
+.uikit-section {
+  margin: 0 0 48px;
+}
+
+.uikit-section > .state-actions + .state-actions,
+.uikit-section > .state-actions + .message-text {
+  margin-top: 16px;
+}

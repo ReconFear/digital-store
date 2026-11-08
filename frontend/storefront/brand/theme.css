@@ -1,0 +1,26 @@
+/* Тема бренда Digital Store: фиолетово-голубые акценты, мягкое свечение, тёмный фон.
+   Значения перенесены из согласованного прототипа (styles.css). Другой бренд заменяет только этот файл.
+
+   Отличие от прототипа (согласовано, вариант А): градиент кнопки покупки немного темнее —
+   #7c5cff -> #5b8cff давал белому тексту контраст 4,35 и 3,16; #7052f5 -> #4470e0 даёт 4,98 и 4,53 (WCAG AA).
+   Свечение кнопки и карточек — прежнее. */
+
+:root {
+  --color-accent: #7c5cff;
+  --color-accent-soft: #9d8cff;
+  --color-accent-2: #00dcff;
+  --color-accent-strong: #7052f5;
+  --color-focus: #00dcff;
+
+  --bg-spot-1: rgba(124, 92, 255, 0.16);
+  --bg-spot-2: rgba(0, 220, 255, 0.10);
+  --gradient-hero: linear-gradient(135deg, rgba(124, 92, 255, 0.22), rgba(22, 25, 35, 0.95), rgba(0, 200, 255, 0.10));
+  --gradient-product-image: linear-gradient(135deg, #242837, #34304d);
+  --gradient-button: linear-gradient(135deg, #7052f5, #4470e0);
+  --border-hero: rgba(124, 92, 255, 0.25);
+  --glow-hero: 0 0 40px rgba(124, 92, 255, 0.08);
+  --glow-card: 0 0 18px rgba(124, 92, 255, 0.35), 0 0 45px rgba(124, 92, 255, 0.14);
+  --glow-button: 0 0 16px rgba(124, 92, 255, 0.6);
+
+  --font-family: Arial, sans-serif;
+}

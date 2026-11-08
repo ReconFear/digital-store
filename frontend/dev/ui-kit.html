@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex, nofollow">
+  <!-- ТОЛЬКО ДЛЯ РАЗРАБОТКИ. Образцы компонентов витрины (кнопки, сообщения, toast, состояния).
+       Не публикуется: папка frontend/dev/ лежит вне frontend/storefront/ и в публичную сборку
+       магазина не копируется (публикуются только frontend/storefront/ и frontend/lib/).
+       Дополнительно ui-kit.js показывает содержимое только на localhost / 127.0.0.1.
+       Открывать через frontend/serve.py: http://127.0.0.1:5500/dev/ui-kit.html -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>UI Kit — только для разработки</title>
+  <link rel="stylesheet" href="../storefront/css/tokens.css">
+  <link rel="stylesheet" href="../storefront/brand/theme.css">
+  <link rel="stylesheet" href="../storefront/css/base.css">
+  <link rel="stylesheet" href="../storefront/css/components.css">
+  <link rel="stylesheet" href="ui-kit.css">
+</head>
+<body>
+  <main class="main" id="main" tabindex="-1">
+    <p class="state state--loading" role="status">Загрузка…</p>
+  </main>
+  <script type="module" src="ui-kit.js"></script>
+</body>
+</html>

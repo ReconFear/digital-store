@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <!-- Политика безопасности: скрипты и стили только из файлов витрины, никакого встроенного кода.
+       connect-src: адрес API для разработки; при выкладке заменить на адрес API магазина (config.js). -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://127.0.0.1:8000; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Digital Store</title>
+  <link rel="stylesheet" href="css/tokens.css">
+  <link rel="stylesheet" href="brand/theme.css">
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/components.css">
+</head>
+<body>
+  <a class="skip-link" href="#main" id="skip-link">Перейти к содержимому</a>
+
+  <header class="header" id="site-header"></header>
+
+  <main class="main" id="main" tabindex="-1">
+    <p class="state state--loading" role="status">Загрузка…</p>
+  </main>
+
+  <footer class="footer" id="site-footer"></footer>
+
+  <noscript>
+    <p class="state state--error">Для работы магазина включите JavaScript в браузере.</p>
+  </noscript>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
